@@ -1,252 +1,215 @@
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TemplateHaskell #-}
 
 module Main where
 
--- jww (2013-08-23): Still need to deal with hard-links.
+import Control.Lens
+import Control.Monad.IO.Class
+import Control.Monad.Trans.State
+import Data.Graph
+import Data.HashMap.Strict
+import Data.IntMap.Strict
+import Data.Time
+import Data.Time.Format
+import Options.Applicative as OA
+import System.Directory
+import System.Exit
+import System.FilePath
+import System.Process
+import Text.Show.Pretty
 
-import           Control.Applicative
-import           Control.Concurrent.ParallelIO
-import           Control.DeepSeq
-import           Control.Exception
-import           Control.Lens
-import           Control.Monad
-import           Data.DList (DList)
-import qualified Data.DList as DL
-import           Data.Function
-import qualified Data.List as L
-import           Data.Monoid
-import           Data.Text as T hiding (filter, map, chunksOf)
-import qualified Data.Text.Encoding as E
-import           Debug.Trace
-import           Filesystem (listDirectory, isFile)
-import           Filesystem.Path.CurrentOS
-import           GHC.Conc
-import           Prelude hiding (FilePath, sequence, catch)
-import           Stat
-import           System.Console.CmdArgs
-import           System.Environment (getArgs, withArgs)
-import           System.Posix.Files hiding (fileBlockSize)
-import           Text.Printf
-import           Text.Regex.PCRE
-import           Unsafe.Coerce
+-- import Text.Regex.TDFA
 
-default (Integer, Text)
-
+type Checksum = String
+
+-- | State of the image repository (new or old).
+data RenamerState = RenamerState
+  { _filepathToIdx :: HashMap FilePath Int,
+    _idxToFilepath :: IntMap FilePath,
+    -- | Mapping from YYYYmmdd to a sequence counter for that day.
+    _dailyCounter :: HashMap String Int,
+    _counter :: Int,
+    _checksums :: HashMap Checksum [FilePath]
+  }
+  deriving (Show)
+
+makeLenses ''RenamerState
+
+newRenamerState :: RenamerState
+newRenamerState =
+  RenamerState
+    { _filepathToIdx = mempty,
+      _idxToFilepath = mempty,
+      _dailyCounter = mempty,
+      _counter = 0,
+      _checksums = mempty
+    }
+
+data FileDetails = FileDetails
+  { _filepath :: FilePath, -- "/foo/bar.CR3"
+    _filedir :: FilePath, -- "/foo"
+    _filename :: FilePath, -- "bar.CR3"
+    _filebase :: FilePath, -- "bar"
+    _filebaseIdx :: Int,
+    _fileext :: FilePath, -- ".CR3"
+    _checksum :: Checksum, -- "<hex string>"
+    _captureTime :: Maybe UTCTime,
+    _fileModTime :: UTCTime,
+    _fileSize :: Integer
+  }
+  deriving (Eq, Show)
+
+makeLenses ''FileDetails
+
+data RepoState = RepoState
+  { _fileDetails :: HashMap FilePath FileDetails
+  }
+  deriving (Show)
+
+makeLenses ''RepoState
+
+data Results = Results
+  { mappings :: Graph
+  }
+  deriving (Show)
+
 version :: String
-version = "2.4.0"
+version = "0.0.1"
 
 copyright :: String
 copyright = "2024"
 
-sizesSummary :: String
-sizesSummary = "sizes v" ++ version ++ ", (C) John Wiegley " ++ copyright
-
-data SizesOpts = SizesOpts { jobs         :: Int
-                           , byCount      :: Bool
-                           , annex        :: Bool
-                           , apparent     :: Bool
-                           , baseTen      :: Bool
-                           , exclude      :: String
-                           , minSize      :: Int
-                           , minCount     :: Int
-                           , blockSize    :: Int
-                           , smalls       :: Bool
-                           -- , dirsOnly  :: Bool
-                           , depth        :: Int
-                           , dirs         :: [String] }
-               deriving (Data, Typeable, Show, Eq)
+summary :: String
+summary =
+  "org-data "
+    ++ version
+    ++ ", (C) "
+    ++ copyright
+    ++ " John Wiegley"
 
-sizesOpts :: SizesOpts
-sizesOpts = SizesOpts
-    { jobs       = def &= name "j" &= typ "INT"
-                       &= help "Run INT concurrent finds at once (default: 2)"
-    , byCount    = def &= name "c" &= typ "BOOL"
-                       &= help "Sort output by count (default: by size)"
-    , annex      = def &= name "A" &= typ "BOOL"
-                       &= help "Be mindful of how git-annex stores files"
-    , apparent   = def &= typ "BOOL"
-                       &= help "Print apparent sizes, rather than disk usage"
-    , baseTen    = def &= name "H" &= typ "BOOL"
-                       &= help "Print amounts divided by 1000 rather than 1024"
-    , exclude    = def &= name "x" &= typ "REGEX"
-                       &= help "Exclude files whose path matches the REGEX"
-    , minSize    = def &= name "m" &= typ "INT"
-                       &= help "Smallest size to show, in MB (default: 10)"
-    , minCount   = def &= name "M" &= typ "INT"
-                       &= help "Smallest count to show (default: 100)"
-    , blockSize  = def &= name "B" &= typ "INT"
-                       &= help "Size of blocks on disk (default: 512)"
-    , smalls     = def &= name "s" &= typ "BOOL"
-                       &= help "Also show small (<1M && <100 files) entries"
-    -- , dirsOnly = def &= typ "BOOL"
-    --                  &= help "Show directories only"
-    , depth      = def &= typ "INT"
-                       &= help "Report entries to a depth of INT (default: 1)"
-    , dirs       = def &= args &= typ "DIRS..." } &=
-    summary sizesSummary &=
-    program "sizes" &=
-    help "Calculate amount of disk used by the given directories"
-
-data EntryInfo = EntryInfo { _entryPath       :: FilePath
-                           , _entryCount      :: Int
-                           , _entryAllocSize  :: Int
-                           , _entryIsDir      :: Bool }
-               deriving Show
+data Options = Options
+  { _verbose :: !Bool,
+    _files :: [FilePath]
+  }
+  deriving (Show, Eq)
 
-makeLenses ''EntryInfo
+makeLenses ''Options
 
-newEntry :: FilePath -> Bool -> EntryInfo
-newEntry p = EntryInfo p 0 0
+options :: Parser Options
+options =
+  Options
+    <$> switch
+      ( short 'v'
+          <> long "verbose"
+          <> help "Report progress verbosely"
+      )
+    <*> some (OA.argument str (metavar "FILES"))
 
-instance Semigroup EntryInfo where
-  x <> y = seq x $ seq y $
-           entryCount      +~ y^.entryCount $
-           entryAllocSize  +~ y^.entryAllocSize $ x
+optionsDefinition :: ParserInfo Options
+optionsDefinition =
+  info
+    (helper <*> options)
+    (fullDesc <> progDesc "" <> header summary)
 
-instance Monoid EntryInfo where
-  mempty = newEntry "" False
-  mappend = (<>)
+getOptions :: IO Options
+getOptions = execParser optionsDefinition
 
-instance NFData EntryInfo where
-  rnf a = a `seq` ()
-
 main :: IO ()
 main = do
-  mainArgs <- getArgs
-  opts     <- withArgs (if L.null mainArgs then [] else mainArgs)
-                      (cmdArgs sizesOpts)
-  _        <- GHC.Conc.setNumCapabilities $ case jobs opts of 0 -> 2; x -> x
-  runSizes $ case depth opts of 0 -> opts { depth = 1 }; _ -> opts
+  opts <- getOptions
+  pPrint opts
+  let rst = newRenamerState
+  details <-
+    flip runStateT rst $
+      mapM getFileDetails (_files opts)
+  pPrint details
 
-runSizes :: SizesOpts -> IO ()
-runSizes opts = do
-  let dirsOpt = dirs opts
-      directories = if L.null dirsOpt then ["."] else dirsOpt
-  reportSizes opts $ map (fromText . pack) directories
-  stopGlobalPool
+b3sum :: FilePath -> IO String
+b3sum path = do
+  (ec, out, err) <-
+    readProcessWithExitCode
+      "b3sum"
+      ["--no-names", "--quiet", path]
+      ""
+  case ec of
+    ExitSuccess -> pure $ init out
+    ExitFailure code -> do
+      putStrLn $ "b3sum failed, code " ++ show code
+      putStrLn $ "error: " ++ err
+      pure ""
 
-reportEntryP :: SizesOpts -> EntryInfo -> Bool
-reportEntryP opts entry = smalls opts
-                          || entry^.entryAllocSize >= minSize'
-                          || entry^.entryCount >= minCount'
-  where
-    minSize'  = (if minSize opts == 0 then 10 else minSize opts) *
-        (if baseTen opts then 1000 else 1024)^2
-    minCount' = if minCount opts == 0 then 100 else minCount opts
+exiv2ImageTimestamp :: FilePath -> IO (Maybe UTCTime)
+exiv2ImageTimestamp path = do
+  (ec, out, err) <-
+    readProcessWithExitCode
+      "exiv2"
+      ["-g", "Exif.Image.DateTime", "-Pv", path]
+      ""
+  case ec of
+    ExitSuccess ->
+      Just
+        <$> parseTimeM
+          False
+          defaultTimeLocale
+          "%0Y:%0m:%0d %0H:%0M:%0S\n"
+          out
+    ExitFailure code -> do
+      -- putStrLn $ "exiv2 failed, code " ++ show code
+      -- putStrLn $ "error: " ++ err
+      pure Nothing
 
-reportSizes :: SizesOpts -> [FilePath] -> IO ()
-reportSizes opts xs = do
-  entryInfos <- parallel $ map reportSizesForDir xs
-  let infos  = map fst entryInfos ++
-               DL.toList (DL.concat (map snd entryInfos))
-      sorted = L.sortBy ((compare `on`) $
-                         if byCount opts
-                         then (^. entryCount)
-                         else (^. entryAllocSize)) infos
-  mapM_ (reportEntry (baseTen opts)) (filter (reportEntryP opts) sorted)
+exiftoolImageTimestamp :: FilePath -> IO (Maybe UTCTime)
+exiftoolImageTimestamp path = do
+  (ec, out, err) <-
+    readProcessWithExitCode
+      "exiftool"
+      ["-DateTimeOriginal", path]
+      ""
+  case ec of
+    ExitSuccess ->
+      Just
+        <$> parseTimeM
+          False
+          defaultTimeLocale
+          "Date/Time Original              : %0Y:%0m:%0d %0H:%0M:%0S\n"
+          out
+    ExitFailure code -> do
+      -- putStrLn $ "exiftool failed, code " ++ show code
+      -- putStrLn $ "error: " ++ err
+      pure Nothing
 
-  where
-    reportSizesForDir =
-      -- fsStatus <- getFilesystemStatus (E.encodeUtf8 (toTextIgnore dir))
-      let fsBlkSize = statBlockSize -- filesystemBlockSize fsStatus
-          opts'     = if blockSize opts == 0
-                      then opts { blockSize = fromIntegral fsBlkSize }
-                      else opts
-      in gatherSizes opts' 0
+registerPath :: FilePath -> Checksum -> StateT RenamerState IO Int
+registerPath path csum = do
+  preuse (checksums . ix path) >>= \case
+    Just paths
+      | path `elem` paths -> pure ()
+      | otherwise -> checksums . ix csum %= (path :)
+    Nothing -> checksums . at csum ?= [path]
 
-humanReadable :: Int -> Int -> String
-humanReadable x div
-  | x < div   = printf "%db" x
-  | x < div^2 = printf "%.0fK" (fromIntegral x / (fromIntegral div :: Double))
-  | x < div^3 = printf "%.1fM" (fromIntegral x / (fromIntegral div^2 :: Double))
-  | x < div^4 = printf "%.2fG" (fromIntegral x / (fromIntegral div^3 :: Double))
-  | x < div^5 = printf "%.3fT" (fromIntegral x / (fromIntegral div^4 :: Double))
-  | x < div^6 = printf "%.3fP" (fromIntegral x / (fromIntegral div^5 :: Double))
-  | x < div^7 = printf "%.3fX" (fromIntegral x / (fromIntegral div^6 :: Double))
-  | otherwise  = printf "%db" x
+  preuse (filepathToIdx . ix path) >>= \case
+    Just idx -> pure idx
+    Nothing -> do
+      idx <- use counter
+      counter += 1
+      filepathToIdx . at path ?= idx
+      idxToFilepath . at idx ?= path
+      pure idx
 
-reportEntry :: Bool -> EntryInfo -> IO ()
-reportEntry bTen entry =
-  let path = unpack (toTextIgnore (entry^.entryPath))
-  in printf
-     (unpack "%10s %10d  %s%s\n")
-     (humanReadable (entry^.entryAllocSize) (if bTen then 1000 else 1024))
-     (entry^.entryCount) path
-     (unpack $ if entry^.entryIsDir && L.last path /= '/'
-               then "/" else "")
-
-toTextIgnore :: FilePath -> Text
-toTextIgnore = either id id . toText
-
-returnEmpty :: FilePath -> IO (EntryInfo, DList EntryInfo)
-returnEmpty path = return (newEntry path False, DL.empty)
-
-gatherSizes :: SizesOpts -> Int -> FilePath -> IO (EntryInfo, DList EntryInfo)
-gatherSizes opts curDepth path = do
-  excl <- if L.null (exclude opts)
-          then return $ Right False
-          else try $ return $ path' =~ exclude opts -- jww (2013-08-15): poor
-  case excl of
-    Left (_ :: SomeException) -> returnEmpty path
-    Right True -> returnEmpty path
-    _ ->
-      catch (go =<< if curDepth == 0
-                    then getFileStatus path'
-                    else getSymbolicLinkStatus path')
-            (\e -> do putStrLn $ path' ++ ": " ++ show (e :: IOException)
-                      returnEmpty path)
-  where
-    pathT = toTextIgnore path
-    path' = unpack pathT
-
-    go status
-      | isDirectory status =
-        foldM (\(y, ys) x -> do
-                  (x',xs') <- gatherSizes opts (curDepth + 1) (collapse x)
-                  let x''  = y <> x'
-                      xs'' = if curDepth < depth opts
-                             then ys <> DL.singleton x' <> xs'
-                             else DL.empty
-                  return $! x'' `seq` xs'' `seq` (x'', xs''))
-              (newEntry path True, DL.empty) =<< listDirectory path
-
-      | (isRegularFile status
-         && not (annex opts && ".git/annex/" `isInfixOf` pathT))
-        || (annex opts && isSymbolicLink status) = do
-        status' <-
-          -- If status is for a symbolic link, it must be a Git-annex'd file
-          if isSymbolicLink status
-          then do
-            destPath <- readSymbolicLink path'
-            if ".git/annex/" `L.isInfixOf` destPath
-              then do
-                let destFilePath  = fromText (T.pack destPath)
-                    destPath'     = if relative destFilePath
-                                    then T.unpack . toTextIgnore $
-                                         parent path </> destFilePath
-                                    else destPath
-                    destFilePath' = fromText (T.pack destPath')
-                exists <- isFile destFilePath'
-                if exists
-                  then getFileStatus destPath'
-                  else return status
-              else return status
-          else return status
-
-        let fsize     = fileSize status'
-            blksize   = fileBlockSize (unsafeCoerce status')
-            allocSize = if apparent opts
-                        then fromIntegral fsize
-                        else fromIntegral blksize * blockSize opts
-
-        return (EntryInfo { _entryPath       = path
-                          , _entryCount      = 1
-                          , _entryAllocSize  = allocSize
-                          , _entryIsDir      = False }, DL.empty)
-
-      | otherwise = returnEmpty path
-
--- Main.hs (sizes) ends here
+getFileDetails :: FilePath -> StateT RenamerState IO FileDetails
+getFileDetails path = do
+  _checksum <- liftIO $ b3sum path
+  idx <- registerPath path _checksum
+  let _filepath = path
+      _filedir = takeDirectory path
+      _filename = takeFileName path
+      _filebase = takeBaseName path
+      _filebaseIdx = idx
+      _fileext = takeExtension path
+  _captureTime <-
+    liftIO $
+      exiv2ImageTimestamp path
+        <|> exiftoolImageTimestamp path
+  _fileModTime <- liftIO $ getModificationTime path
+  _fileSize <- liftIO $ getFileSize path
+  pure FileDetails {..}
