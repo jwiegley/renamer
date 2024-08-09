@@ -1,0 +1,31 @@
+cabal-version: 1.12
+
+-- This file has been generated from package.yaml by hpack version 0.36.0.
+--
+-- see: https://github.com/sol/hpack
+
+name:           renamer
+version:        1.0.0
+synopsis:       Tool to rename photos
+description:    Tool to rename photos
+category:       System
+homepage:       https://github.com/jwiegley/renamer#readme
+bug-reports:    https://github.com/jwiegley/renamer/issues
+author:         John Wiegley
+maintainer:     johnw@newartisans.com
+license:        BSD3
+license-file:   LICENSE
+build-type:     Simple
+
+source-repository head
+  type: git
+  location: https://github.com/jwiegley/renamer
+
+executable renamer
+  main-is: Main.hs
+  other-modules:
+      Paths_renamer
+  ghc-options: -threaded
+  build-depends:
+      base >=4.7
+  default-language: Haskell2010

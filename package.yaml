@@ -1,0 +1,48 @@
+name:       renamer
+version:    1.0.0
+synopsis:   Tool to rename photos
+github:     jwiegley/renamer
+author:     John Wiegley
+maintainer: johnw@newartisans.com
+category:   System
+license:    BSD3
+
+description:
+  Tool to rename photos
+
+dependencies:
+  - base                 >= 4.7
+  # - aeson
+  # - bytestring           >= 0.10
+  # - containers           >= 0.6
+  # - directory
+  # - filepath
+  # - foldl
+  # - io-storage           >= 0.3
+  # - lens                 >= 4.9
+  # - logging              >= 3.0
+  # - monad-logger         >= 0.3
+  # - old-locale           >= 1.0
+  # - optparse-applicative >= 0.10
+  # - parallel-io          >= 0.3
+  # - pipes
+  # - pipes-group
+  # - pipes-safe
+  # - pipes-text
+  # - regex-posix          >= 0.95
+  # - safe                 >= 0.3
+  # - shelly               >= 1.6
+  # - system-fileio        >= 0.3
+  # - system-filepath      >= 0.4
+  # - temporary            >= 1.2
+  # - text                 >= 1.2
+  # - time                 >= 1.4
+  # - transformers         >= 0.3
+  # - unix                 >= 2.6
+  # - unordered-containers >= 0.2
+  # - yaml
+
+executables:
+  renamer:
+    main: Main.hs
+    ghc-options: -threaded
