@@ -7,6 +7,11 @@ maintainer: johnw@newartisans.com
 category:   System
 license:    BSD3
 
+ghc-options:
+   - -Wall
+   - -Wno-missing-home-modules
+   - -fprof-auto
+
 description:
   Tool to rename photos
 

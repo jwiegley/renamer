@@ -25,7 +25,7 @@ executable renamer
   main-is: Main.hs
   other-modules:
       Paths_renamer
-  ghc-options: -threaded
+  ghc-options: -Wall -Wno-missing-home-modules -fprof-auto -threaded
   build-depends:
       base >=4.7
     , containers >=0.6
