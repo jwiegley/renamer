@@ -10,10 +10,11 @@ import Control.Lens hiding ((<.>))
 import Control.Monad (unless, when)
 import Control.Monad.IO.Class
 import Control.Monad.Trans.State
+import Data.Char (toLower)
 import Data.Foldable (foldrM, forM_)
 import Data.HashMap.Strict hiding (foldr')
 import Data.IntMap.Strict hiding (foldr')
-import Data.List (sort)
+import Data.List (nub, sort)
 import Data.Maybe (fromMaybe)
 import Data.Time
 import Data.Traversable (forM)
@@ -23,8 +24,8 @@ import System.Exit
 import System.FilePath
 import System.Process
 import Text.Printf
-
--- import Text.Regex.TDFA
+import Text.Regex.TDFA
+import Text.Regex.TDFA.String ()
 
 version :: String
 version = "0.0.1"
@@ -44,6 +45,7 @@ data Options = Options
   { _verbose :: !Bool,
     _checksums :: !Bool,
     _showPlan :: !Bool,
+    _resetNames :: !Bool,
     _transfers :: Maybe ([FilePath], FilePath),
     _repositories :: [FilePath]
   }
@@ -61,11 +63,29 @@ data FileType
   | XmpFile
   deriving (Show, Eq)
 
+makePrisms ''FileType
+
+data FileDetails = FileDetails
+  { _captureTime :: Maybe UTCTime,
+    _fileModTime :: UTCTime,
+    _filepath :: FilePath, -- "/foo/bar.CR3"
+    _filedir :: FilePath, -- "/foo"
+    _filename :: FilePath, -- "bar.CR3"
+    _filebase :: FilePath, -- "bar"
+    _fileIdx :: Int,
+    _fileext :: FilePath, -- ".CR3"
+    _checksum :: Maybe Checksum, -- "<hex string>"
+    _fileSize :: Integer
+  }
+  deriving (Eq, Ord, Show)
+
+makeLenses ''FileDetails
+
 -- | State of the image repository (new or old).
 data RenamerState = RenamerState
   { _filepathToIdx :: HashMap FilePath Int,
-    _idxToFilepath :: IntMap FilePath,
-    -- | Mapping from YYYYmmdd to a sequence counter for that day.
+    _idxToFilepath :: IntMap (FilePath, Maybe Checksum),
+    -- | Mapping from YYmmdd to a sequence counter for that day.
     _dailyCounter :: HashMap String Int,
     _fileIdxCounter :: Int,
     _uniqueCounter :: Int,
@@ -88,22 +108,6 @@ newRenamerState opts =
       _options = opts
     }
 
-data FileDetails = FileDetails
-  { _captureTime :: Maybe UTCTime,
-    _fileModTime :: UTCTime,
-    _filepath :: FilePath, -- "/foo/bar.CR3"
-    _filedir :: FilePath, -- "/foo"
-    _filename :: FilePath, -- "bar.CR3"
-    _filebase :: FilePath, -- "bar"
-    _fileIdx :: Int,
-    _fileext :: FilePath, -- ".CR3"
-    _checksum :: Checksum, -- "<hex string>"
-    _fileSize :: Integer
-  }
-  deriving (Eq, Ord, Show)
-
-makeLenses ''FileDetails
-
 type AppT = StateT RenamerState
 
 runAppT :: (Monad m) => Options -> AppT m a -> m a
@@ -125,9 +129,13 @@ renamerOptions =
       ( long "plan"
           <> help "Show the execution plan instead of running it"
       )
+    <*> switch
+      ( long "reset"
+          <> help "Ignore current names and reset all"
+      )
     <*> optional
       ( (,)
-          <$> many
+          <$> some
             ( OA.strOption
                 ( long "from"
                     <> help "Entries to move into --to directory"
@@ -156,8 +164,9 @@ main = do
   runAppT opts $ do
     details <- sort <$> gatherDetails entries
     names <- generateNames details
-    plan <- safeguardPlan =<< buildPlan (zip details names)
-    printPlan plan
+    buildPlan (zip details names)
+      >>= safeguardPlan
+      >>= executePlan
 
 -- | All path entries implied by the option set.
 allEntries :: Options -> [FilePath]
@@ -166,62 +175,55 @@ allEntries opts =
     Nothing -> []
     Just (paths, path) -> path : paths
 
-safeguardPlan :: [(Int, Int)] -> AppT IO [(Int, Int)]
+safeguardPlan :: (Monad m) => [(Int, Int)] -> AppT m [(Int, Int)]
 safeguardPlan = foldrM go []
   where
-    go :: (Int, Int) -> [(Int, Int)] -> AppT IO [(Int, Int)]
-    go (src, dst) rest = do
-      dstPath <- use (idxToFilepath . ix dst)
-      isFile <- liftIO $ doesFileExist dstPath
-      if isFile
-        then do
+    go (src, dst) rest
+      | dst `elem` Prelude.map fst rest = do
           uniqueIdx <- use uniqueCounter
           uniqueCounter += 1
-          let tmpPath = takeDirectory dstPath </> show uniqueIdx
-          tmpIsFile <- liftIO $ doesFileExist tmpPath
-          when tmpIsFile $
-            error $
-              "Temporary is present: " ++ tmpPath
-          idx <- registerPath tmpPath ""
-          if dst `elem` Prelude.map fst rest
-            then
-              if dst `elem` Prelude.map snd rest
-                then error $ "Destination mentioned twice: " ++ dstPath
-                else
-                  pure $
-                    (dst, idx)
-                      : (src, dst)
-                      : Prelude.map
-                        ( \(x, y) ->
-                            if x == dst
-                              then (idx, y)
-                              else (x, y)
-                        )
-                        rest
-            else do
-              liftIO $
-                putStrLn $
-                  "Destination never referenced again: " ++ dstPath
-              pure $ (src, dst) : rest
-        else pure $ (src, dst) : rest
+          (dstPath, _) <- use (idxToFilepath . ix dst)
+          idx <-
+            registerPath
+              (takeDirectory dstPath </> "tmp_" ++ show uniqueIdx)
+              Nothing
+          pure $ (src, idx) : rest ++ [(idx, dst)]
+      | otherwise = pure $ (src, dst) : rest
 
-printPlan :: [(Int, Int)] -> AppT IO ()
-printPlan = mapM_ $ \(src, dst) -> do
-  srcPath <- use (idxToFilepath . ix src)
-  dstPath <- use (idxToFilepath . ix dst)
-  liftIO $ putStrLn $ srcPath ++ " -> " ++ dstPath
+executePlan :: [(Int, Int)] -> AppT IO ()
+executePlan plan = do
+  -- opts <- use options
+  forM_ plan $ \(src, dst) -> do
+    (srcPath, csum) <- use (idxToFilepath . ix src)
+    (dstPath, _) <- use (idxToFilepath . ix dst)
+    -- liftIO $ safeMoveFile (opts ^. showPlan) srcPath csum dstPath
+    liftIO $ safeMoveFile True srcPath csum dstPath
 
 buildPlan ::
   (Monad m) =>
   [(FileDetails, FilePath)] ->
   AppT m [(Int, Int)]
-buildPlan xs = foldrM go [] xs
+buildPlan xs = do
+  plan <- foldrM go [] xs
+  let srcs = sort (Prelude.map fst plan)
+      dsts = sort (Prelude.map snd plan)
+  unless (srcs == nub srcs) $
+    error "buildPlan failure: moving from same source multiple times"
+  unless (dsts == nub dsts) $
+    error "buildPlan failure: moving to same destination multiple times"
+  pure plan
   where
     go (details, baseName) rest
       | details ^. filebase == baseName = pure rest
       | otherwise = do
-          let newPath = details ^. filedir </> baseName <.> details ^. fileext
-          idx <- registerPath newPath (details ^. checksum)
+          idx <-
+            registerPath
+              ( details ^. filedir
+                  </> Prelude.map
+                    toLower
+                    (baseName <.> details ^. fileext)
+              )
+              Nothing
           pure $ (details ^. fileIdx, idx) : rest
 
 -- | Takes a list of files and/or directories, and gathers file details for
@@ -246,60 +248,72 @@ generateNames ds =
   zoom dailyCounter $ forM ds $ generateBaseName . getTime
   where
     generateBaseName tm =
-      baseName yyyymmdd
-        <$> ( preuse (ix yyyymmdd)
+      baseName yymmdd
+        <$> ( preuse (ix yymmdd)
                 >>= \case
-                  Just idx -> idx <$ (ix yyyymmdd += 1)
-                  Nothing -> 1 <$ (at yyyymmdd ?= 2)
+                  Just idx -> idx <$ (ix yymmdd += 1)
+                  Nothing -> 1 <$ (at yymmdd ?= 2)
             )
       where
-        yyyymmdd = formatTime defaultTimeLocale "%y%m%d" tm
+        yymmdd = formatTime defaultTimeLocale "%y%m%d" tm
 
         baseName :: String -> Int -> String
         baseName s n = s ++ "_" ++ printf "%04d" n
 
-safePruneDirectory :: Options -> FilePath -> IO ()
-safePruneDirectory opts path = do
+safePruneDirectory :: Bool -> FilePath -> IO ()
+safePruneDirectory planOnly path = do
   entries <- listDirectory path
   safeToRemove <- flip execStateT True $
     forM_ entries $ \entry -> do
       let entryPath = path </> entry
       isDir <- liftIO $ doesDirectoryExist entryPath
       if isDir
-        then liftIO $ safePruneDirectory opts entryPath
+        then liftIO $ safePruneDirectory planOnly entryPath
         else put False
   when safeToRemove $
-    if opts ^. showPlan
+    if planOnly
       then putStrLn $ "rmdir \"" ++ path ++ "\""
       else removeDirectory path
 
-safeMoveFile :: Options -> FilePath -> Checksum -> FilePath -> IO ()
-safeMoveFile opts src csum dest
-  | opts ^. showPlan = do
-      putStrLn $ "cp -p \"" ++ src ++ "\" \"" ++ dest ++ "\""
+safeMoveFile :: Bool -> FilePath -> Maybe Checksum -> FilePath -> IO ()
+safeMoveFile planOnly src srcSum dest
+  | planOnly =
       putStrLn $
-        "if [[ $(b3sum --no-names --quiet \""
-          ++ dest
-          ++ "\") == "
-          ++ csum
-          ++ " ]]; then rm -f \""
+        "safecopy \""
           ++ src
-          ++ "\"; fi"
+          ++ "\" \""
+          ++ dest
+          ++ "\" \""
+          ++ maybe "" id srcSum
+          ++ "\""
   | otherwise = do
-      copyFileWithMetadata src dest
-      csum' <- b3sum dest
-      if csum == csum'
-        then removeFile src
-        else
-          putStrLn $
-            "MOVE FAILED, checksum mismatch: "
-              ++ src
-              ++ " -> "
-              ++ dest
-              ++ ": "
-              ++ csum
-              ++ " != "
-              ++ csum'
+      csum <- case srcSum of
+        Just csum -> pure csum
+        Nothing -> b3sum src
+      isFile <- doesFileExist dest
+      if isFile
+        then do
+          csum' <- b3sum dest
+          if csum == csum'
+            then removeFile src
+            else
+              putStrLn $
+                "MOVE FAILED, destination already exists: " ++ dest
+        else do
+          copyFileWithMetadata src dest
+          csum' <- b3sum dest
+          if csum == csum'
+            then removeFile src
+            else
+              putStrLn $
+                "MOVE FAILED, checksum mismatch: "
+                  ++ src
+                  ++ " -> "
+                  ++ dest
+                  ++ ": "
+                  ++ csum
+                  ++ " != "
+                  ++ csum'
 
 b3sum :: FilePath -> IO String
 b3sum path = do
@@ -356,10 +370,9 @@ exiftoolImageTimestamp path = do
       pure Nothing
 
 -- | Register a path name, return its unique integer identifier.
-registerPath :: (Monad m) => FilePath -> Checksum -> AppT m Int
-registerPath path csum = do
-  computeChecksum <- use (options . checksums)
-  when (computeChecksum && not (Prelude.null csum)) $
+registerPath :: (Monad m) => FilePath -> Maybe Checksum -> AppT m Int
+registerPath path mcsum = do
+  forM_ mcsum $ \csum ->
     preuse (fileChecksums . ix path) >>= \case
       Just paths
         | path `elem` paths -> pure ()
@@ -372,7 +385,7 @@ registerPath path csum = do
       idx <- use fileIdxCounter
       fileIdxCounter += 1
       filepathToIdx . at path ?= idx
-      idxToFilepath . at idx ?= path
+      idxToFilepath . at idx ?= (path, mcsum)
       pure idx
 
 walkFileEntries :: (MonadIO m) => (FilePath -> m a) -> FilePath -> m [a]
@@ -385,10 +398,7 @@ walkFileEntries f path = do
     else (: []) <$> f path
 
 getTime :: FileDetails -> UTCTime
-getTime d =
-  fromMaybe
-    (d ^. fileModTime)
-    (d ^. captureTime)
+getTime d = fromMaybe (d ^. fileModTime) (d ^. captureTime)
 
 getFileDetails :: FilePath -> AppT IO FileDetails
 getFileDetails path = do
@@ -399,19 +409,36 @@ getFileDetails path = do
   computeChecksum <- use (options . checksums)
   _checksum <-
     if computeChecksum
-      then liftIO $ b3sum path
-      else pure ""
-  idx <- registerPath path _checksum
+      then liftIO $ Just <$> b3sum path
+      else pure Nothing
   let _filepath = path
       _filedir = takeDirectory path
       _filename = takeFileName path
       _filebase = takeBaseName path
-      _fileIdx = idx
       _fileext = takeExtension path
+  _fileIdx <-
+    registerPath
+      (_filedir </> Prelude.map toLower _filename)
+      _checksum
   _captureTime <-
     liftIO $
       exiv2ImageTimestamp path
         <|> exiftoolImageTimestamp path
   _fileModTime <- liftIO $ getModificationTime path
   _fileSize <- liftIO $ getFileSize path
+  rn <- use (options . resetNames)
+  unless rn $ do
+    case _filebase
+           =~ ( "^([0-9][0-9][0-9][0-9][0-9][0-9])_([0-9][0-9][0-9][0-9])$" ::
+                  String
+              ) ::
+           [[String]] of
+      [(_ : yymmdd : counter : [])] ->
+        forM_
+          ( parseTimeM False defaultTimeLocale "%0y%0m%0d" yymmdd ::
+              Maybe UTCTime
+          )
+          $ \_ ->
+            dailyCounter . at yymmdd ?= read counter
+      _ -> pure ()
   pure FileDetails {..}
