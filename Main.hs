@@ -35,7 +35,7 @@ copyright = "2024"
 
 summary :: String
 summary =
-  "org-data "
+  "renamer "
     ++ version
     ++ ", (C) "
     ++ copyright
@@ -388,6 +388,26 @@ registerPath path mcsum = do
       idxToFilepath . at idx ?= (path, mcsum)
       pure idx
 
+registerCounter :: (Monad m) => FilePath -> AppT m ()
+registerCounter path = do
+  -- jww (2024-08-12): Instead of using --reset, use sub-commands to reflect
+  -- when renaming of an existing repository should be done.
+  rn <- use (options . resetNames)
+  unless rn $ do
+    case path
+           =~ ( "^([0-9][0-9][0-9][0-9][0-9][0-9])_([0-9][0-9][0-9][0-9])$" ::
+                  String
+              ) ::
+           [[String]] of
+      [(_ : yymmdd : counter : [])] ->
+        forM_
+          ( parseTimeM False defaultTimeLocale "%0y%0m%0d" yymmdd ::
+              Maybe UTCTime
+          )
+          $ \_ ->
+            dailyCounter . at yymmdd ?= read counter
+      _ -> pure ()
+
 walkFileEntries :: (MonadIO m) => (FilePath -> m a) -> FilePath -> m [a]
 walkFileEntries f path = do
   isDir <- liftIO $ doesDirectoryExist path
@@ -420,25 +440,11 @@ getFileDetails path = do
     registerPath
       (_filedir </> Prelude.map toLower _filename)
       _checksum
+  registerCounter _filepath
   _captureTime <-
     liftIO $
       exiv2ImageTimestamp path
         <|> exiftoolImageTimestamp path
   _fileModTime <- liftIO $ getModificationTime path
   _fileSize <- liftIO $ getFileSize path
-  rn <- use (options . resetNames)
-  unless rn $ do
-    case _filebase
-           =~ ( "^([0-9][0-9][0-9][0-9][0-9][0-9])_([0-9][0-9][0-9][0-9])$" ::
-                  String
-              ) ::
-           [[String]] of
-      [(_ : yymmdd : counter : [])] ->
-        forM_
-          ( parseTimeM False defaultTimeLocale "%0y%0m%0d" yymmdd ::
-              Maybe UTCTime
-          )
-          $ \_ ->
-            dailyCounter . at yymmdd ?= read counter
-      _ -> pure ()
   pure FileDetails {..}
