@@ -21,7 +21,8 @@ import Data.List (sort)
 import Data.Maybe (fromMaybe)
 import Data.Time
 import Data.Traversable (forM)
-import Options.Applicative as OA
+import Options.Applicative hiding (command)
+import Options.Applicative qualified as OA
 import System.Directory
 import System.Exit
 import System.FilePath
@@ -108,12 +109,18 @@ newRenamerState =
  - Step 2: Environment
  -}
 
+data Command
+  = ImportPhotos [FilePath] FilePath [FilePath]
+  | RenamePhotos [FilePath]
+  deriving (Show, Eq)
+
+makePrisms ''Command
+
 data Options = Options
   { _verbose :: !Bool,
     _checksums :: !Bool,
-    _dryRun :: !Bool,
-    _transfers :: Maybe ([FilePath], FilePath),
-    _repositories :: [FilePath]
+    _execute :: !Bool,
+    _command :: Command
   }
   deriving (Show, Eq)
 
@@ -247,9 +254,7 @@ getFileDetails gather path = do
         ".xmp" -> XmpFile
         _ -> UnknownExtension
   _fileIdx <-
-    registerPath
-      (_filedir </> Prelude.map toLower _filename)
-      _checksum
+    registerPath (_filedir </> Prelude.map toLower _filename) _checksum
   -- jww (2024-08-12): Instead of using --reset, use sub-commands to reflect
   -- when renaming of an existing repository should be done.
   when gather $
@@ -267,14 +272,14 @@ getFileDetails gather path = do
 
 -- | Takes a list of files and/or directories, and gathers file details for
 --   all files involved, recursively.
-gatherDetails :: [(FilePath, Bool)] -> AppT IO [FileDetails]
-gatherDetails entries =
+gatherDetails :: Bool -> [FilePath] -> AppT IO [FileDetails]
+gatherDetails gather entries =
   -- Get info on all entries; this is stateful and builds up the following
   -- tables:
   --   filepathToIdx
   --   idxToFilepath
   --   fileChecksums
-  fmap concat $ forM entries $ \(entry, gather) -> do
+  fmap concat $ forM entries $ \entry -> do
     putStrLn_ $ "Gathering details from " ++ show entry
     walkFileEntries (getFileDetails gather) entry
 
@@ -329,16 +334,17 @@ idealName = zoom dailyCounter . generateBaseName . getTime
 
 buildPlan ::
   (Monad m) =>
+  Maybe FilePath ->
   [(FileDetails, FilePath)] ->
   AppT m [(Int, Int)]
-buildPlan = safeguardPlan <=< foldrM go []
+buildPlan destDir = safeguardPlan <=< foldrM go []
   where
     go (details, baseName) rest
       | details ^. filebase == baseName = pure rest
       | otherwise = do
           idx <-
             registerPath
-              ( details ^. filedir
+              ( fromMaybe (details ^. filedir) destDir
                   </> Prelude.map
                     toLower
                     (baseName <.> details ^. fileext)
@@ -375,8 +381,13 @@ buildPlan = safeguardPlan <=< foldrM go []
  - Step 7: Execute
  -}
 
--- jww (2024-08-13): Prune directories from import source when done.
-safePruneDirectory :: FilePath -> AppT IO ()
+safeRemoveDirectory :: (MonadIO m) => FilePath -> AppT m ()
+safeRemoveDirectory path = do
+  putStrLn_ $ "- " ++ path
+  dry <- not <$> view execute
+  unless dry $ liftIO $ removeDirectory path
+
+safePruneDirectory :: (MonadIO m) => FilePath -> AppT m ()
 safePruneDirectory path = do
   entries <- liftIO $ listDirectory path
   safeToRemove <- flip execStateT True $
@@ -386,56 +397,92 @@ safePruneDirectory path = do
       if isDir
         then lift $ safePruneDirectory entryPath
         else put False
-  when safeToRemove $ do
-    putStrLn_ $ "- " ++ path
-    dry <- view dryRun
-    unless dry $
-      liftIO $
-        removeDirectory path
+  when safeToRemove $
+    safeRemoveDirectory path
+
+safeRemoveFile :: (MonadIO m) => FilePath -> AppT m ()
+safeRemoveFile path = do
+  putStrLn_ $ "- " ++ path
+  dry <- not <$> view execute
+  unless dry $ liftIO $ removeFile path
 
 safeMoveFile :: FilePath -> Maybe Checksum -> FilePath -> AppT IO ()
-safeMoveFile src srcSum dest = do
-  putStrLn_ $ src ++ " -> " ++ dest
-  dry <- view dryRun
-  unless dry $ liftIO $ do
-    csum <- case srcSum of
-      Just csum -> pure csum
-      Nothing -> b3sum src
-    isFile <- doesFileExist dest
-    if isFile
-      then do
-        csum' <- b3sum dest
-        if csum == csum'
-          then removeFile src
-          else
-            putStrLn $
-              "MOVE FAILED, destination already exists: " ++ dest
-      else do
-        copyFileWithMetadata src dest
-        csum' <- b3sum dest
-        if csum == csum'
-          then removeFile src
-          else
-            putStrLn $
-              "MOVE FAILED, checksum mismatch: "
-                ++ src
-                ++ " -> "
-                ++ dest
-                ++ ": "
-                ++ csum
-                ++ " != "
-                ++ csum'
+safeMoveFile src srcSum dst = do
+  shouldMove <- case srcSum of
+    Just csum ->
+      preuse (fileChecksums . ix csum) >>= \case
+        Just _ -> pure False
+        _ -> pure True
+    Nothing -> pure True
+  if shouldMove
+    then do
+      putStrLn_ $ src ++ " -> " ++ dst
+      csum <- case srcSum of
+        Just csum -> pure csum
+        Nothing -> do
+          isFile <- liftIO $ doesFileExist src
+          -- This can be False if we are not in --execute mode, and the move
+          -- is from a temp file that was never created.
+          if isFile
+            then liftIO $ b3sum src
+            else pure ""
+      isFile <- liftIO $ doesFileExist dst
+      if isFile
+        then do
+          csum' <- liftIO $ b3sum dst
+          if csum == csum'
+            then safeRemoveFile src
+            else
+              liftIO $
+                putStrLn $
+                  "MOVE FAILED, destination already exists: " ++ dst
+        else do
+          dry <- not <$> view execute
+          unless dry $ do
+            liftIO $ copyFileWithMetadata src dst
+            csum' <- liftIO $ b3sum dst
+            if csum == csum'
+              then safeRemoveFile src
+              else
+                liftIO $
+                  putStrLn $
+                    "MOVE FAILED, checksum mismatch: "
+                      ++ csum
+                      ++ " != "
+                      ++ csum'
+    else do
+      putStrLn_ $ "Duplicate: " ++ src
+      safeRemoveFile src
 
 executePlan :: [(Int, Int)] -> AppT IO ()
-executePlan plan = do
-  -- opts <- use options
-  forM_ plan $ \(src, dst) -> do
-    (srcPath, csum) <- use (idxToFilepath . ix src)
-    (dstPath, _) <- use (idxToFilepath . ix dst)
-    safeMoveFile srcPath csum dstPath
+executePlan plan = forM_ plan $ \(src, dst) -> do
+  (srcPath, csum) <- use (idxToFilepath . ix src)
+  (dstPath, _) <- use (idxToFilepath . ix dst)
+  safeMoveFile srcPath csum dstPath
 
 {-------------------------------------------------------------------------
- - Step 8: Driver
+ - Step 8: Commands
+ -}
+
+buildAndExecutePlan :: Bool -> [FilePath] -> Maybe FilePath -> AppT IO ()
+buildAndExecutePlan gather dirs mdest = do
+  details <- sort <$> gatherDetails gather dirs
+  mapM idealName details
+    >>= buildPlan mdest . zip details
+    >>= executePlan
+
+renamePhotos :: [FilePath] -> AppT IO ()
+renamePhotos dirs = buildAndExecutePlan True dirs Nothing
+
+importPhotos :: [FilePath] -> FilePath -> [FilePath] -> AppT IO ()
+importPhotos froms toPath dirs = do
+  -- Gather details to determine daily sequence numbers, checksums, etc.
+  _ <- gatherDetails True dirs
+  buildAndExecutePlan False froms (Just toPath)
+  mapM_ safePruneDirectory froms
+
+{-------------------------------------------------------------------------
+ - Step 9: Driver
  -}
 
 version :: String
@@ -452,62 +499,71 @@ summary =
     ++ copyright
     ++ " John Wiegley"
 
--- jww (2024-08-13): Use subcommands to distinguish between importing,
--- renaming, name checking, validation, etc.
-renamerOptions :: Parser Options
-renamerOptions =
-  Options
-    <$> switch
-      ( short 'v'
-          <> long "verbose"
-          <> help "Report progress verbosely"
-      )
-    <*> switch
-      ( long "checksum"
-          <> help "Compute file checksums to detect duplicates"
-      )
-    <*> switch
-      ( long "dry-run"
-          <> help "Show the execution plan instead of running it"
-      )
-    <*> optional
-      ( (,)
-          <$> some
-            ( OA.strOption
-                ( long "from"
-                    <> help "Entries to move into --to directory"
-                )
-            )
-          <*> OA.strOption
-            ( long "to"
-                <> help "Directory to move --from entries into"
-            )
-      )
-    <*> some (OA.argument str (metavar "ENTRIES"))
-
-optionsDefinition :: ParserInfo Options
-optionsDefinition =
-  info
-    (helper <*> renamerOptions)
-    (fullDesc <> progDesc "" <> header summary)
-
-getOptions :: IO Options
-getOptions = execParser optionsDefinition
-
--- | All path entries implied by the option set.
-allEntries :: Options -> [(FilePath, Bool)]
-allEntries opts =
-  Prelude.map (,True) (opts ^. repositories) ++ case opts ^. transfers of
-    Nothing -> []
-    Just (paths, path) -> (path, False) : Prelude.map (,True) paths
-
 main :: IO ()
 main = do
   opts <- getOptions
-  runAppT opts $ do
-    details <- sort <$> gatherDetails (allEntries opts)
-    -- jww (2024-08-13): Only map idealName over the --from entries when
-    -- importing.
-    mapM idealName details
-      >>= buildPlan . zip details
-      >>= executePlan
+  runAppT opts $ case opts ^. command of
+    RenamePhotos dirs -> renamePhotos dirs
+    ImportPhotos froms toPath dirs -> importPhotos froms toPath dirs
+  where
+    getOptions :: IO Options
+    getOptions = execParser optionsDefinition
+      where
+        optionsDefinition :: ParserInfo Options
+        optionsDefinition =
+          info
+            (helper <*> renamerOptions)
+            (fullDesc <> progDesc "" <> header summary)
+
+    renamerOptions :: Parser Options
+    renamerOptions =
+      Options
+        <$> switch
+          ( short 'v'
+              <> long "verbose"
+              <> help "Report progress verbosely"
+          )
+        <*> switch
+          ( long "checksum"
+              <> help "Compute file checksums to detect duplicates"
+          )
+        <*> switch
+          ( long "dry-run"
+              <> help "Show the execution plan instead of running it"
+          )
+        <*> hsubparser
+          ( importCommand
+              <> renameCommand
+          )
+      where
+        importCommand :: Mod CommandFields Command
+        importCommand =
+          OA.command
+            "import"
+            (info importOptions (progDesc "Import photos"))
+          where
+            importOptions :: Parser Command
+            importOptions =
+              ImportPhotos
+                <$> some
+                  ( OA.strOption
+                      ( long "from"
+                          <> help "Entries to move into --to directory"
+                      )
+                  )
+                <*> OA.strOption
+                  ( long "to"
+                      <> help "Directory to move --from entries into"
+                  )
+                <*> some (OA.argument str (metavar "ENTRIES"))
+
+        renameCommand :: Mod CommandFields Command
+        renameCommand =
+          OA.command
+            "rename"
+            (info renameOptions (progDesc "Rename photos"))
+          where
+            renameOptions :: Parser Command
+            renameOptions =
+              RenamePhotos
+                <$> some (OA.argument str (metavar "ENTRIES"))
