@@ -255,8 +255,6 @@ getFileDetails gather path = do
         _ -> UnknownExtension
   _fileIdx <-
     registerPath (_filedir </> Prelude.map toLower _filename) _checksum
-  -- jww (2024-08-12): Instead of using --reset, use sub-commands to reflect
-  -- when renaming of an existing repository should be done.
   when gather $
     registerCounter _filepath
   _captureTime <-
