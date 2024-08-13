@@ -35,14 +35,25 @@ import Text.Regex.TDFA.String ()
 type Checksum = String
 
 data FileType
-  = JpegFile
-  | PngFile
-  | RawFile
+  = RawFile
   | TiffFile
+  | PsdFile
+  | JpegFile
+  | PngFile
   | XmpFile
-  deriving (Show, Eq)
+  | UnknownExtension
+  deriving (Show, Eq, Ord)
 
 makePrisms ''FileType
+
+isImage :: FileType -> Bool
+isImage = \case
+  RawFile -> True
+  TiffFile -> True
+  PsdFile -> True
+  JpegFile -> True
+  PngFile -> True
+  _ -> False
 
 data FileDetails = FileDetails
   { _captureTime :: Maybe UTCTime,
@@ -54,6 +65,7 @@ data FileDetails = FileDetails
     _fileIdx :: Int,
     _fileext :: FilePath, -- ".CR3"
     _checksum :: Maybe Checksum, -- "<hex string>"
+    _fileType :: FileType,
     _fileSize :: Integer
   }
   deriving (Eq, Ord, Show)
@@ -66,6 +78,7 @@ data RenamerState = RenamerState
     _idxToFilepath :: IntMap (FilePath, Maybe Checksum),
     -- | Mapping from YYmmdd to a sequence counter for that day.
     _dailyCounter :: HashMap String Int,
+    _entriesAtTime :: HashMap String [FileDetails],
     _fileIdxCounter :: Int,
     _uniqueCounter :: Int,
     _fileChecksums :: HashMap Checksum [FilePath]
@@ -80,6 +93,7 @@ newRenamerState =
     { _filepathToIdx = mempty,
       _idxToFilepath = mempty,
       _dailyCounter = mempty,
+      _entriesAtTime = mempty,
       _fileIdxCounter = 0,
       _uniqueCounter = 0,
       _fileChecksums = mempty
@@ -93,7 +107,6 @@ data Options = Options
   { _verbose :: !Bool,
     _checksums :: !Bool,
     _dryRun :: !Bool,
-    _resetNames :: !Bool,
     _transfers :: Maybe ([FilePath], FilePath),
     _repositories :: [FilePath]
   }
@@ -206,8 +219,8 @@ exiftoolImageTimestamp path = do
       -- putStrLn $ "error: " ++ err
       pure Nothing
 
-getFileDetails :: FilePath -> AppT IO FileDetails
-getFileDetails path = do
+getFileDetails :: Bool -> FilePath -> AppT IO FileDetails
+getFileDetails gather path = do
   isFile <- liftIO $ doesFileExist path
   unless isFile $
     error $
@@ -222,35 +235,49 @@ getFileDetails path = do
       _filename = takeFileName path
       _filebase = takeBaseName path
       _fileext = takeExtension path
+      _fileType = case Prelude.map toLower _fileext of
+        ".crw" -> RawFile
+        ".cr2" -> RawFile
+        ".cr3" -> RawFile
+        ".tif" -> TiffFile
+        ".tiff" -> TiffFile
+        ".psd" -> PsdFile
+        ".jpg" -> JpegFile
+        ".jpeg" -> JpegFile
+        ".png" -> PngFile
+        ".xmp" -> XmpFile
+        _ -> UnknownExtension
   _fileIdx <-
     registerPath
       (_filedir </> Prelude.map toLower _filename)
       _checksum
   -- jww (2024-08-12): Instead of using --reset, use sub-commands to reflect
   -- when renaming of an existing repository should be done.
-  reset <- view resetNames
-  unless reset $
+  when gather $
     registerCounter _filepath
   _captureTime <-
-    liftIO $
-      exiv2ImageTimestamp path
-        <|> exiftoolImageTimestamp path
+    if isImage _fileType
+      then
+        liftIO $
+          exiv2ImageTimestamp path
+            <|> exiftoolImageTimestamp path
+      else pure Nothing
   _fileModTime <- liftIO $ getModificationTime path
   _fileSize <- liftIO $ getFileSize path
   pure FileDetails {..}
 
 -- | Takes a list of files and/or directories, and gathers file details for
 --   all files involved, recursively.
-gatherDetails :: [FilePath] -> AppT IO [FileDetails]
+gatherDetails :: [(FilePath, Bool)] -> AppT IO [FileDetails]
 gatherDetails entries =
   -- Get info on all entries; this is stateful and builds up the following
   -- tables:
   --   filepathToIdx
   --   idxToFilepath
   --   fileChecksums
-  fmap concat $ forM entries $ \entry -> do
+  fmap concat $ forM entries $ \(entry, gather) -> do
     liftIO $ putStrLn $ "Gathering details from " ++ show entry
-    walkFileEntries getFileDetails entry
+    walkFileEntries (getFileDetails gather) entry
 
 walkFileEntries :: (MonadIO m) => (FilePath -> m a) -> FilePath -> m [a]
 walkFileEntries f path = do
@@ -265,13 +292,24 @@ walkFileEntries f path = do
  - Step 5: Naming
  -}
 
--- | Given a list of file details, determine the base name for each entry.
-generateNames :: (Monad m) => [FileDetails] -> AppT m [FilePath]
-generateNames ds =
-  -- Sort the entries by capture date and determine the goal basenames;
-  -- this is stateful and builds up the following table:
-  --   dailyCounter
-  zoom dailyCounter $ forM ds $ generateBaseName . getTime
+-- | Determine the ideal name for a given photo, in the context of the
+--   repository where it is meant to abide.
+--
+--   1. It should contain the date when the photo was taken.
+--
+--   2. It should contain the sequence of which photo it was that day.
+--
+--   3. jww (2024-08-13): If it is the alternate version (different extension)
+--      of an existing photo, it should share the sequence number:
+--
+--      - 240813_0001.CR3
+--      - 240813_0001.JPG
+--
+--      The alternate version is detected both either checking for the same
+--      basename (A.CR3, A.JPG) or for the same data+time of capture, although
+--      only the latter of these two is needed.
+idealName :: (Monad m) => FileDetails -> AppT m FilePath
+idealName = zoom dailyCounter . generateBaseName . getTime
   where
     generateBaseName tm =
       baseName yymmdd
@@ -409,6 +447,8 @@ summary =
     ++ copyright
     ++ " John Wiegley"
 
+-- jww (2024-08-13): Use subcommands to distinguish between importing,
+-- renaming, name checking, validation, etc.
 renamerOptions :: Parser Options
 renamerOptions =
   Options
@@ -425,10 +465,6 @@ renamerOptions =
       ( long "dry-run"
           <> help "Show the execution plan instead of running it"
       )
-    <*> switch
-      ( long "reset-names"
-          <> help "Ignore current names and reset all"
-      )
     <*> optional
       ( (,)
           <$> some
@@ -442,7 +478,7 @@ renamerOptions =
                 <> help "Directory to move --from entries into"
             )
       )
-    <*> some (OA.argument str (metavar "REPOS"))
+    <*> some (OA.argument str (metavar "ENTRIES"))
 
 optionsDefinition :: ParserInfo Options
 optionsDefinition =
@@ -454,19 +490,20 @@ getOptions :: IO Options
 getOptions = execParser optionsDefinition
 
 -- | All path entries implied by the option set.
-allEntries :: Options -> [FilePath]
+allEntries :: Options -> [(FilePath, Bool)]
 allEntries opts =
-  (opts ^. repositories) ++ case opts ^. transfers of
+  Prelude.map (,True) (opts ^. repositories) ++ case opts ^. transfers of
     Nothing -> []
-    Just (paths, path) -> path : paths
+    Just (paths, path) -> (path, False) : Prelude.map (,True) paths
 
 main :: IO ()
 main = do
   opts <- getOptions
-  let entries = allEntries opts
   runAppT opts $ do
-    details <- sort <$> gatherDetails entries
-    generateNames details
+    details <- sort <$> gatherDetails (allEntries opts)
+    -- jww (2024-08-13): Only map idealName over the --from entries when
+    -- importing.
+    mapM idealName details
       >>= buildPlan . zip details
       >>= safeguardPlan
       >>= executePlan (opts ^. dryRun)
