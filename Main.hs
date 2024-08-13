@@ -7,15 +7,17 @@
 module Main where
 
 import Control.Lens hiding ((<.>))
-import Control.Monad (unless, when)
+import Control.Monad (unless, when, (<=<))
 import Control.Monad.IO.Class
+import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Reader
 import Control.Monad.Trans.State
 import Data.Char (toLower)
 import Data.Foldable (foldrM, forM_)
 import Data.HashMap.Strict hiding (foldr')
 import Data.IntMap.Strict hiding (foldr')
-import Data.List (nub, sort)
+import Data.IntSet qualified as S
+import Data.List (sort)
 import Data.Maybe (fromMaybe)
 import Data.Time
 import Data.Traversable (forM)
@@ -31,8 +33,6 @@ import Text.Regex.TDFA.String ()
 {-------------------------------------------------------------------------
  - Step 1: Schema
  -}
-
-type Checksum = String
 
 data FileType
   = RawFile
@@ -55,6 +55,8 @@ isImage = \case
   PngFile -> True
   _ -> False
 
+type Checksum = String
+
 data FileDetails = FileDetails
   { _captureTime :: Maybe UTCTime,
     _fileModTime :: UTCTime,
@@ -71,6 +73,9 @@ data FileDetails = FileDetails
   deriving (Eq, Ord, Show)
 
 makeLenses ''FileDetails
+
+getTime :: FileDetails -> UTCTime
+getTime d = fromMaybe (d ^. fileModTime) (d ^. captureTime)
 
 -- | State of the image repository (new or old).
 data RenamerState = RenamerState
@@ -158,12 +163,14 @@ registerCounter path =
           dailyCounter . at yymmdd ?= read counter
     _ -> pure ()
 
-getTime :: FileDetails -> UTCTime
-getTime d = fromMaybe (d ^. fileModTime) (d ^. captureTime)
-
 {-------------------------------------------------------------------------
  - Step 4: Analyze
  -}
+
+putStrLn_ :: (MonadIO m) => String -> AppT m ()
+putStrLn_ s = do
+  v <- view verbose
+  when v $ liftIO $ putStrLn s
 
 b3sum :: FilePath -> IO String
 b3sum path = do
@@ -174,10 +181,8 @@ b3sum path = do
       ""
   case ec of
     ExitSuccess -> pure $ init out
-    ExitFailure code -> do
-      putStrLn $ "b3sum failed, code " ++ show code
-      putStrLn $ "error: " ++ err
-      pure ""
+    ExitFailure code ->
+      error $ "b3sum failed, code " ++ show code ++ ": " ++ err
 
 exiv2ImageTimestamp :: FilePath -> IO (Maybe UTCTime)
 exiv2ImageTimestamp path = do
@@ -194,10 +199,7 @@ exiv2ImageTimestamp path = do
           defaultTimeLocale
           "%0Y:%0m:%0d %0H:%0M:%0S\n"
           out
-    ExitFailure _code -> do
-      -- putStrLn $ "exiv2 failed, code " ++ show code
-      -- putStrLn $ "error: " ++ err
-      pure Nothing
+    ExitFailure _code -> pure Nothing
 
 exiftoolImageTimestamp :: FilePath -> IO (Maybe UTCTime)
 exiftoolImageTimestamp path = do
@@ -214,10 +216,7 @@ exiftoolImageTimestamp path = do
           defaultTimeLocale
           "Date/Time Original              : %0Y:%0m:%0d %0H:%0M:%0S\n"
           out
-    ExitFailure _code -> do
-      -- putStrLn $ "exiftool failed, code " ++ show code
-      -- putStrLn $ "error: " ++ err
-      pure Nothing
+    ExitFailure _code -> pure Nothing
 
 getFileDetails :: Bool -> FilePath -> AppT IO FileDetails
 getFileDetails gather path = do
@@ -276,7 +275,7 @@ gatherDetails entries =
   --   idxToFilepath
   --   fileChecksums
   fmap concat $ forM entries $ \(entry, gather) -> do
-    liftIO $ putStrLn $ "Gathering details from " ++ show entry
+    putStrLn_ $ "Gathering details from " ++ show entry
     walkFileEntries (getFileDetails gather) entry
 
 walkFileEntries :: (MonadIO m) => (FilePath -> m a) -> FilePath -> m [a]
@@ -332,15 +331,7 @@ buildPlan ::
   (Monad m) =>
   [(FileDetails, FilePath)] ->
   AppT m [(Int, Int)]
-buildPlan xs = do
-  plan <- foldrM go [] xs
-  let srcs = sort (Prelude.map fst plan)
-      dsts = sort (Prelude.map snd plan)
-  unless (srcs == nub srcs) $
-    error "buildPlan failure: moving from same source multiple times"
-  unless (dsts == nub dsts) $
-    error "buildPlan failure: moving to same destination multiple times"
-  pure plan
+buildPlan = safeguardPlan <=< foldrM go []
   where
     go (details, baseName) rest
       | details ^. filebase == baseName = pure rest
@@ -352,55 +343,61 @@ buildPlan xs = do
                     toLower
                     (baseName <.> details ^. fileext)
               )
-              Nothing
+              (details ^. checksum)
           pure $ (details ^. fileIdx, idx) : rest
 
-safeguardPlan :: (Monad m) => [(Int, Int)] -> AppT m [(Int, Int)]
-safeguardPlan = foldrM go []
-  where
-    go (src, dst) rest
-      | dst `elem` Prelude.map fst rest = do
-          uniqueIdx <- use uniqueCounter
-          uniqueCounter += 1
-          (dstPath, _) <- use (idxToFilepath . ix dst)
-          idx <-
-            registerPath
-              (takeDirectory dstPath </> "tmp_" ++ show uniqueIdx)
-              Nothing
-          pure $ (src, idx) : rest ++ [(idx, dst)]
-      | otherwise = pure $ (src, dst) : rest
+    safeguardPlan plan = do
+      unless (length srcs == S.size srcs') $
+        error "buildPlan: moving from same source multiple times"
+      unless (length dsts == S.size dsts') $
+        error "buildPlan: moving to same destination multiple times"
+      foldrM work [] plan
+      where
+        (srcs, dsts) = unzip plan
+
+        srcs' = S.fromList srcs
+        dsts' = S.fromList dsts
+
+        work (src, dst) rest
+          | S.member dst srcs' = do
+              uniqueIdx <- use uniqueCounter
+              uniqueCounter += 1
+              (dstPath, csum) <- use (idxToFilepath . ix dst)
+              idx <-
+                registerPath
+                  (takeDirectory dstPath </> "tmp_" ++ show uniqueIdx)
+                  csum
+              pure $ (src, idx) : rest ++ [(idx, dst)]
+          | otherwise =
+              pure $ (src, dst) : rest
 
 {-------------------------------------------------------------------------
  - Step 7: Execute
  -}
 
-executePlan :: Bool -> [(Int, Int)] -> AppT IO ()
-executePlan dry plan = do
-  -- opts <- use options
-  forM_ plan $ \(src, dst) -> do
-    (srcPath, csum) <- use (idxToFilepath . ix src)
-    (dstPath, _) <- use (idxToFilepath . ix dst)
-    liftIO $ safeMoveFile dry srcPath csum dstPath
-
-safePruneDirectory :: Bool -> FilePath -> IO ()
-safePruneDirectory dry path = do
-  entries <- listDirectory path
+-- jww (2024-08-13): Prune directories from import source when done.
+safePruneDirectory :: FilePath -> AppT IO ()
+safePruneDirectory path = do
+  entries <- liftIO $ listDirectory path
   safeToRemove <- flip execStateT True $
     forM_ entries $ \entry -> do
       let entryPath = path </> entry
       isDir <- liftIO $ doesDirectoryExist entryPath
       if isDir
-        then liftIO $ safePruneDirectory dry entryPath
+        then lift $ safePruneDirectory entryPath
         else put False
   when safeToRemove $ do
-    putStrLn $ "- " ++ path
+    putStrLn_ $ "- " ++ path
+    dry <- view dryRun
     unless dry $
-      removeDirectory path
+      liftIO $
+        removeDirectory path
 
-safeMoveFile :: Bool -> FilePath -> Maybe Checksum -> FilePath -> IO ()
-safeMoveFile dry src srcSum dest = do
-  putStrLn $ src ++ " -> " ++ dest
-  unless dry $ do
+safeMoveFile :: FilePath -> Maybe Checksum -> FilePath -> AppT IO ()
+safeMoveFile src srcSum dest = do
+  putStrLn_ $ src ++ " -> " ++ dest
+  dry <- view dryRun
+  unless dry $ liftIO $ do
     csum <- case srcSum of
       Just csum -> pure csum
       Nothing -> b3sum src
@@ -428,6 +425,14 @@ safeMoveFile dry src srcSum dest = do
                 ++ csum
                 ++ " != "
                 ++ csum'
+
+executePlan :: [(Int, Int)] -> AppT IO ()
+executePlan plan = do
+  -- opts <- use options
+  forM_ plan $ \(src, dst) -> do
+    (srcPath, csum) <- use (idxToFilepath . ix src)
+    (dstPath, _) <- use (idxToFilepath . ix dst)
+    safeMoveFile srcPath csum dstPath
 
 {-------------------------------------------------------------------------
  - Step 8: Driver
@@ -505,5 +510,4 @@ main = do
     -- importing.
     mapM idealName details
       >>= buildPlan . zip details
-      >>= safeguardPlan
-      >>= executePlan (opts ^. dryRun)
+      >>= executePlan
