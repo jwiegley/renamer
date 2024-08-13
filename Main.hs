@@ -1,8 +1,12 @@
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TypeOperators #-}
 
 module Main where
 
@@ -18,6 +22,7 @@ import Data.HashMap.Strict hiding (foldr')
 import Data.IntMap.Strict hiding (foldr')
 import Data.IntSet qualified as S
 import Data.List (sort)
+import Data.Map.Strict (Map)
 import Data.Maybe (fromMaybe)
 import Data.Time
 import Data.Traversable (forM)
@@ -30,6 +35,7 @@ import System.Process
 import Text.Printf
 import Text.Regex.TDFA
 import Text.Regex.TDFA.String ()
+import Text.Show.Pretty
 
 {-------------------------------------------------------------------------
  - Step 1: Schema
@@ -84,7 +90,8 @@ data RenamerState = RenamerState
     _idxToFilepath :: IntMap (FilePath, Maybe Checksum),
     -- | Mapping from YYmmdd to a sequence counter for that day.
     _dailyCounter :: HashMap String Int,
-    _entriesAtTime :: HashMap String [FileDetails],
+    -- | Mapping from YYmmddHHMMSS to a list of entries for that moment.
+    _entriesAtTime :: Map UTCTime [FileDetails],
     _fileIdxCounter :: Int,
     _uniqueCounter :: Int,
     _fileChecksums :: HashMap Checksum [FilePath]
@@ -135,15 +142,25 @@ runAppT opts k = evalStateT (runReaderT k opts) newRenamerState
  - Step 3: Database manipulation
  -}
 
+addToList :: (IxValue a ~ [b], Eq b, At a) => Index a -> b -> a -> a
+addToList k v m =
+  case m ^? ix k of
+    Just vs
+      | v `elem` vs -> m
+      | otherwise -> m & ix k %~ (v :)
+    Nothing -> m & at k ?~ [v]
+
+-- | Register a path name, return its unique integer identifier.
+registerDatedEntry :: (Monad m) => FileDetails -> AppT m ()
+registerDatedEntry details =
+  forM_ (details ^. captureTime) $ \stamp ->
+    entriesAtTime %= addToList stamp details
+
 -- | Register a path name, return its unique integer identifier.
 registerPath :: (Monad m) => FilePath -> Maybe Checksum -> AppT m Int
 registerPath path mcsum = do
   forM_ mcsum $ \csum ->
-    preuse (fileChecksums . ix path) >>= \case
-      Just paths
-        | path `elem` paths -> pure ()
-        | otherwise -> fileChecksums . ix csum %= (path :)
-      Nothing -> fileChecksums . at csum ?= [path]
+    fileChecksums %= addToList csum path
 
   preuse (filepathToIdx . ix path) >>= \case
     Just idx -> pure idx
@@ -253,8 +270,6 @@ getFileDetails gather path = do
         ".png" -> PngFile
         ".xmp" -> XmpFile
         _ -> UnknownExtension
-  _fileIdx <-
-    registerPath (_filedir </> Prelude.map toLower _filename) _checksum
   when gather $
     registerCounter _filepath
   _captureTime <-
@@ -264,9 +279,15 @@ getFileDetails gather path = do
           exiv2ImageTimestamp path
             <|> exiftoolImageTimestamp path
       else pure Nothing
+  _fileIdx <-
+    registerPath
+      (_filedir </> Prelude.map toLower _filename)
+      _checksum
   _fileModTime <- liftIO $ getModificationTime path
   _fileSize <- liftIO $ getFileSize path
-  pure FileDetails {..}
+  let details = FileDetails {..}
+  registerDatedEntry details
+  pure details
 
 -- | Takes a list of files and/or directories, and gathers file details for
 --   all files involved, recursively.
@@ -294,6 +315,14 @@ walkFileEntries f path = do
  - Step 5: Naming
  -}
 
+nextSeqNum :: (Monad m) => String -> AppT m Int
+nextSeqNum yymmdd =
+  zoom dailyCounter $
+    preuse (ix yymmdd)
+      >>= \case
+        Just idx -> idx <$ (ix yymmdd += 1)
+        Nothing -> 1 <$ (at yymmdd ?= 2)
+
 -- | Determine the ideal name for a given photo, in the context of the
 --   repository where it is meant to abide.
 --
@@ -310,21 +339,19 @@ walkFileEntries f path = do
 --      The alternate version is detected both either checking for the same
 --      basename (A.CR3, A.JPG) or for the same data+time of capture, although
 --      only the latter of these two is needed.
-idealName :: (Monad m) => FileDetails -> AppT m FilePath
-idealName = zoom dailyCounter . generateBaseName . getTime
+idealName :: (MonadIO m) => FileDetails -> AppT m FilePath
+idealName details = do
+  liftIO $ pPrint details
+  mres <- preuse (dailyCounter . ix yymmdd)
+  liftIO $ pPrint mres
+  forM_ (details ^. captureTime) $ \stamp -> do
+    mres' <- preuse (entriesAtTime . ix stamp)
+    liftIO $ pPrint mres'
+  seqNum <- nextSeqNum yymmdd
+  pure $ yymmdd ++ "_" ++ printf "%04d" seqNum
   where
-    generateBaseName tm =
-      baseName yymmdd
-        <$> ( preuse (ix yymmdd)
-                >>= \case
-                  Just idx -> idx <$ (ix yymmdd += 1)
-                  Nothing -> 1 <$ (at yymmdd ?= 2)
-            )
-      where
-        yymmdd = formatTime defaultTimeLocale "%y%m%d" tm
-
-        baseName :: String -> Int -> String
-        baseName s n = s ++ "_" ++ printf "%04d" n
+    tm = getTime details
+    yymmdd = formatTime defaultTimeLocale "%y%m%d" tm
 
 {-------------------------------------------------------------------------
  - Step 6: Plan
