@@ -17,6 +17,7 @@ description:
 
 dependencies:
   - base                 >= 4.7
+  - aeson
   - containers           >= 0.6
   - directory
   - filepath

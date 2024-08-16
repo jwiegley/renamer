@@ -27,7 +27,8 @@ executable renamer
       Paths_renamer
   ghc-options: -Wall -Wno-missing-home-modules -fprof-auto -threaded
   build-depends:
-      base >=4.7
+      aeson
+    , base >=4.7
     , containers >=0.6
     , directory
     , filepath
