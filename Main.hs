@@ -31,6 +31,8 @@ import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
 import Data.Time
 -- import Debug.Trace
+
+import Data.Traversable (forM)
 import GHC.Conc (setNumCapabilities)
 import GHC.Generics (Generic)
 import Options.Applicative hiding (command)
@@ -440,8 +442,8 @@ normalizeExt ext = case strToLower ext of
 siblingRenamings ::
   [FileDetails] ->
   [RenamedFile] ->
-  [RenamedFile]
-siblingRenamings xs rs = concatMap go rs
+  [Either String RenamedFile]
+siblingRenamings xs rs = evalState (concatMapM go rs) (renamedFrom, renamedTo)
   where
     siblings :: HashMap FilePath [FileDetails]
     siblings =
@@ -464,26 +466,41 @@ siblingRenamings xs rs = concatMap go rs
           . to (partition (\y -> y ^. fileext == details ^. fileext)) of
         Just (ys, zs)
           | ys == [details] && hasUniqueExts zs ->
-              Prelude.map
-                ( \z ->
-                    RenamedFile
-                      z
-                      (name z)
-                      ( FollowBase
-                          (details ^. filename)
-                          (name z)
-                      )
+              mapM
+                ( \z -> do
+                    (renFrom, renTo) <- get
+                    if (z ^. filename) `HS.member` renFrom
+                      then
+                        pure $
+                          Left $
+                            "WARNING: Already renamed from source: "
+                              ++ z ^. filename
+                              ++ " -> "
+                              ++ name z
+                      else
+                        if name z `HS.member` renTo
+                          then
+                            pure $
+                              Left $
+                                "WARNING: Already renamed to target: "
+                                  ++ z ^. filename
+                                  ++ " -> "
+                                  ++ name z
+                          else do
+                            let ren =
+                                  RenamedFile
+                                    z
+                                    (name z)
+                                    ( FollowBase
+                                        (details ^. filename)
+                                        (name z)
+                                    )
+                            _1 . at (z ^. filename) ?= ()
+                            _2 . at (name z) ?= ()
+                            pure $ Right ren
                 )
-                ( filter
-                    ( \z ->
-                        not
-                          ( (z ^. filename) `HS.member` renamedFrom
-                              || name z `HS.member` renamedTo
-                          )
-                    )
-                    zs
-                )
-        _ -> []
+                zs
+        _ -> pure []
       where
         base = takeBaseName newname
         name d = base <.> ext d
@@ -561,15 +578,19 @@ removeNeedlessRenamings =
 --   4. jww (2024-08-13): If it is the alternate version (different extension)
 --      of an existing photo, it should share the sequence number.
 renameFiles ::
-  (Monad m) =>
+  (MonadIO m) =>
   TimeZone ->
   [FileDetails] ->
   AppT m [RenamedFile]
-renameFiles tz ds =
-  removeNeedlessRenamings
-    . (\rs -> rs ++ siblingRenamings ds rs)
-    . removeNeedlessRenamings
-    <$> simpleRenamings tz ds
+renameFiles tz ds = do
+  rs <- removeNeedlessRenamings <$> simpleRenamings tz ds
+  removeNeedlessRenamings <$> go rs
+  where
+    go rs = do
+      rss' <- forM (siblingRenamings ds rs) $ \case
+        Right ren -> pure [ren]
+        Left msg -> [] <$ putStrLn_ Normal msg
+      pure $ rs ++ concat rss'
 
 {-------------------------------------------------------------------------
  - Step 6: Plan
