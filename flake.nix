@@ -35,10 +35,10 @@
                   ];
                   withHoogle = true;
                 };
-                # modules = [{
-                #   enableLibraryProfiling = true;
-                #   enableProfiling = true;
-                # }];
+                modules = [{
+                  enableLibraryProfiling = true;
+                  enableProfiling = true;
+                }];
               };
           })
         ];

@@ -1,4 +1,3 @@
-{-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ImportQualifiedPost #-}
@@ -9,12 +8,12 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeOperators #-}
-{-# LANGUAGE ViewPatterns #-}
 
 module Main where
 
+import Control.Concurrent.ParallelIO
 import Control.Lens hiding ((<.>))
-import Control.Monad (unless, when, (<=<))
+import Control.Monad (unless, when)
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Reader
@@ -28,11 +27,12 @@ import Data.HashSet qualified as HS
 import Data.IntMap.Strict (IntMap)
 import Data.IntSet qualified as S
 import Data.List (group, nub, partition, sort)
-import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
 import Data.Time
-import GHC.Generics
+-- import Debug.Trace
+import GHC.Conc (setNumCapabilities)
+import GHC.Generics (Generic)
 import Options.Applicative hiding (command)
 import Options.Applicative qualified as OA
 import System.Directory
@@ -46,12 +46,19 @@ import Text.Show.Pretty
 import Prelude hiding (putStrLn)
 import Prelude qualified as Pre (putStrLn)
 
+strToLower :: String -> String
+strToLower = Prelude.map toLower
+
+concatMapM :: (Traversable t, Monad m) => (a -> m [b]) -> t a -> m [b]
+concatMapM = (fmap concat .) . mapM
+
+duplicatedElements :: (Ord a) => [a] -> [a]
+duplicatedElements =
+  nub . concat . filter ((> 1) . length) . group . sort
+
 {-------------------------------------------------------------------------
  - Step 1: Schema
  -}
-
-strToLower :: String -> String
-strToLower = Prelude.map toLower
 
 isImage :: String -> Bool
 isImage ext = case strToLower ext of
@@ -102,6 +109,7 @@ type DetailsMap = HashMap FilePath FileDetails
 
 data Renaming
   = SimpleRename UTCTime FilePath
+  | SimpleRenameAvoidOverlap UTCTime FilePath
   | FollowBase FilePath FilePath
   | FollowTime FilePath FilePath
   deriving (Eq, Show)
@@ -174,6 +182,7 @@ data Options = Options
   { _quiet :: !Bool,
     _verbose :: !Bool,
     _debug :: !Bool,
+    _jobs :: !Int,
     _checksums :: !Bool,
     _execute :: !Bool,
     _keepState :: !Bool,
@@ -182,6 +191,30 @@ data Options = Options
   deriving (Show, Eq)
 
 makeLenses ''Options
+
+logErr :: (MonadIO m) => String -> AppT m ()
+logErr msg = do
+  liftIO $ Pre.putStrLn $ "ERROR: " ++ msg
+  errorCount += 1
+
+data Verbosity
+  = Normal
+  | Verbose
+  | Debug
+
+putStrLn_ :: (MonadIO m) => Verbosity -> String -> AppT m ()
+putStrLn_ verb s = do
+  q <- view quiet
+  v <- view verbose
+  d <- view debug
+  when
+    ( not q && case verb of
+        Debug -> d
+        Verbose -> d || v
+        Normal -> True
+    )
+    $ liftIO
+    $ Pre.putStrLn s
 
 type AppT m = ReaderT Options (StateT RenamerState m)
 
@@ -219,49 +252,27 @@ registerPath path mcsum = do
       idxToFilepath . at idx ?= (path, mcsum)
       pure idx
 
+nameRe :: String
+nameRe = "^([0-9][0-9][0-9][0-9][0-9][0-9])_([0-9][0-9][0-9][0-9])$"
+
 registerCounter :: (Monad m) => FilePath -> AppT m ()
-registerCounter path =
-  case path
-         =~ ( "^([0-9][0-9][0-9][0-9][0-9][0-9])_([0-9][0-9][0-9][0-9])$" ::
-                String
-            ) ::
-         [[String]] of
-    [(_ : ymd : counter : [])] ->
-      forM_
-        ( parseTimeM False defaultTimeLocale "%0y%0m%0d" ymd ::
-            Maybe UTCTime
-        )
-        $ \_ ->
-          dailyCounter . at ymd ?= read counter
-    _ -> pure ()
+registerCounter path = case path =~ nameRe of
+  [(_ : ymd : counter : [])] ->
+    forM_
+      ( parseTimeM
+          False
+          defaultTimeLocale
+          "%0y%0m%0d"
+          ymd ::
+          Maybe UTCTime
+      )
+      $ \_ ->
+        dailyCounter . at ymd ?= read counter
+  _ -> pure ()
 
 {-------------------------------------------------------------------------
  - Step 4: Analyze
  -}
-
-logErr :: (MonadIO m) => String -> AppT m ()
-logErr msg = do
-  liftIO $ Pre.putStrLn $ "ERROR: " ++ msg
-  errorCount += 1
-
-data Verbosity
-  = Normal
-  | Verbose
-  | Debug
-
-putStrLn_ :: (MonadIO m) => Verbosity -> String -> AppT m ()
-putStrLn_ verb s = do
-  q <- view quiet
-  v <- view verbose
-  d <- view debug
-  when
-    ( not q && case verb of
-        Debug -> d
-        Verbose -> d || v
-        Normal -> True
-    )
-    $ liftIO
-    $ Pre.putStrLn s
 
 b3sum :: FilePath -> IO String
 b3sum path = do
@@ -309,13 +320,12 @@ exiftoolImageTimestamp path = do
           out
     ExitFailure _code -> pure Nothing
 
-getFileDetails :: Bool -> FilePath -> AppT IO FileDetails
-getFileDetails gather path = do
+getFileDetails :: Bool -> FilePath -> IO FileDetails
+getFileDetails computeChecksum path = do
   isFile <- liftIO $ doesFileExist path
   unless isFile $
     error $
       "File does not exist: " ++ path
-  computeChecksum <- view checksums
   _checksum <-
     if computeChecksum
       then liftIO $ Just <$> b3sum path
@@ -325,8 +335,6 @@ getFileDetails gather path = do
       _filename = takeFileName path
       _filebase = takeBaseName path
       _fileext = takeExtension path
-  when gather $
-    registerCounter _filepath
   _captureTime <-
     if isImage _fileext
       then
@@ -334,25 +342,44 @@ getFileDetails gather path = do
           exiftoolImageTimestamp path
             <|> exiv2ImageTimestamp path
       else pure Nothing
-  _fileIdx <- registerPath (_filedir </> _filename) _checksum
+  let _fileIdx = -1
   _fileModTime <- liftIO $ getModificationTime path
   _fileSize <- liftIO $ getFileSize path
   pure FileDetails {..}
 
-concatMapM :: (Traversable t, Monad m) => (a -> m [b]) -> t a -> m [b]
-concatMapM = (fmap concat .) . mapM
+registerFileDetails :: Bool -> FileDetails -> AppT IO FileDetails
+registerFileDetails gather FileDetails {..} = do
+  when gather $
+    registerCounter _filepath
+  _fileIdx <- registerPath (_filedir </> _filename) _checksum
+  pure FileDetails {..}
+
+walkFileEntries ::
+  (MonadIO m) =>
+  (FilePath -> m a) ->
+  FilePath ->
+  m [m a]
+walkFileEntries f path = do
+  isDir <- liftIO $ doesDirectoryExist path
+  if isDir
+    then do
+      liftIO $ Pre.putStrLn $ "Gathering details from " ++ show path
+      concatMapM (walkFileEntries f . (path </>))
+        =<< liftIO (listDirectory path)
+    else pure [f path]
 
 -- | Takes a list of files and/or directories, and gathers file details for
 --   all files involved, recursively.
 gatherDetails :: Bool -> [FilePath] -> AppT IO [FileDetails]
-gatherDetails gather =
+gatherDetails gather = concatMapM $ \entry -> do
   -- Get info on all entries; this is stateful and builds up the following
   -- tables:
   --   filepathToIdx
   --   idxToFilepath
   --   fileChecksums
-  concatMapM $ \entry -> do
-    isDir <- liftIO $ doesDirectoryExist entry
+  c <- view checksums
+  isDir <- liftIO $ doesDirectoryExist entry
+  details <-
     if isDir
       then do
         let detailsFile = entry </> ".file-details.json"
@@ -367,25 +394,17 @@ gatherDetails gather =
             lift $ put st
             pure details
           Nothing -> do
-            details <- walkFileEntries (getFileDetails gather) entry
+            details <-
+              liftIO $
+                parallelInterleaved =<< walkFileEntries (getFileDetails c) entry
             st <- lift get
             liftIO $ encodeFile detailsFile (details, st)
             pure details
-      else walkFileEntries (getFileDetails gather) entry
-
-walkFileEntries ::
-  (MonadIO m) =>
-  (FilePath -> AppT m a) ->
-  FilePath ->
-  AppT m [a]
-walkFileEntries f path = do
-  isDir <- liftIO $ doesDirectoryExist path
-  if isDir
-    then do
-      putStrLn_ Normal $ "Gathering details from " ++ show path
-      concatMapM (walkFileEntries f . (path </>))
-        =<< liftIO (listDirectory path)
-    else (: []) <$> f path
+      else
+        liftIO $
+          parallelInterleaved =<< walkFileEntries (getFileDetails c) entry
+  liftIO stopGlobalPool
+  mapM (registerFileDetails gather) details
 
 {-------------------------------------------------------------------------
  - Step 5: Naming
@@ -413,6 +432,120 @@ normalizeExt ext = case strToLower ext of
   ".tiff" -> ".tif"
   ext' -> ext'
 
+-- | Also rename files that are "close" to files being renamed. For example,
+--   so that FOO.JPG moves to BAR.JPG when we rename FOO.CR3 to BAR.CR3. This
+--   association can happen either due to both files having the same
+--   timestamp, or the same basename (which is needed for files that have no
+--   capture timestamp, like XMP).
+siblingRenamings ::
+  [FileDetails] ->
+  [RenamedFile] ->
+  [RenamedFile]
+siblingRenamings xs rs = concatMap go rs
+  where
+    siblings :: HashMap FilePath [FileDetails]
+    siblings =
+      Prelude.foldl' (\m x -> addToList (x ^. filebase) x m) mempty xs
+
+    renamedFrom :: HashSet FilePath
+    renamedFrom =
+      Prelude.foldl'
+        (\m (RenamedFile d _ _) -> m & at (d ^. filename) ?~ ())
+        mempty
+        rs
+
+    renamedTo :: HashSet FilePath
+    renamedTo =
+      Prelude.foldl' (\m (RenamedFile _ nm _) -> m & at nm ?~ ()) mempty rs
+
+    go (RenamedFile details newname _) =
+      case siblings
+        ^? ix (details ^. filebase)
+          . to (partition (\y -> y ^. fileext == details ^. fileext)) of
+        Just (ys, zs)
+          | ys == [details] && hasUniqueExts zs ->
+              Prelude.map
+                ( \z ->
+                    RenamedFile
+                      z
+                      (name z)
+                      ( FollowBase
+                          (details ^. filename)
+                          (name z)
+                      )
+                )
+                ( filter
+                    ( \z ->
+                        not
+                          ( (z ^. filename) `HS.member` renamedFrom
+                              || name z `HS.member` renamedTo
+                          )
+                    )
+                    zs
+                )
+        _ -> []
+      where
+        base = takeBaseName newname
+        name d = base <.> ext d
+        ext d = normalizeExt (d ^. fileext)
+
+-- | Map photos with capture times to an file having the name YYMMDD_NNNN,
+--   where NNNN is a sequence number ordered by time of capture.
+--
+--   If multiple photos have the same timestamp, and all have different file
+--   extensions, then these are all given the same sequence number. If there
+--   are overlapping extensions, then all photos are given unique sequence
+--   numbers.
+--
+--   Note that this function aims to be very simple, and so does not perform
+--   every possible optimization, such as removing needless renamings that
+--   would be idempotent.
+simpleRenamings ::
+  (Monad m) =>
+  TimeZone ->
+  [FileDetails] ->
+  AppT m [RenamedFile]
+simpleRenamings tz = do
+  fmap reverse
+    . foldrM go []
+    . M.toDescList
+    . Prelude.foldl'
+      (\m x -> maybe m (\tm -> addToList tm x m) (x ^. captureTime))
+      mempty
+  where
+    go (tm, entries) rest = do
+      entries' <-
+        if hasUniqueExts entries
+          then rename (SimpleRename tm) entries
+          else
+            concatMapM
+              (rename (SimpleRenameAvoidOverlap tm) . (: []))
+              entries
+      pure $ entries' ++ rest
+      where
+        rename _ [] = pure []
+        rename f (e : es) = do
+          base <- expectedBase
+          pure $
+            work f base e []
+              ++ foldr (work (FollowTime (e ^. filename)) base) [] es
+          where
+            work ren base details = (RenamedFile details named (ren named) :)
+              where
+                named = name details
+                name d = base <.> ext d
+                ext d = normalizeExt (d ^. fileext)
+
+            expectedBase = newName (yymmdd tm') <$> nextSeqNum (yymmdd tm')
+              where
+                tm' = utcToLocalTime tz tm
+                newName base seqNum = base ++ "_" ++ printf "%04d" seqNum
+
+-- | Remove entries that would rename a file to itself.
+removeNeedlessRenamings :: [RenamedFile] -> [RenamedFile]
+removeNeedlessRenamings =
+  filter (\ren -> ren ^. sourceDetails . filename /= ren ^. renamedFile)
+
 -- | Determine the ideal name for a given photo, in the context of the
 --   repository where it is meant to abide. Note that this function is called
 --   only after all file details have been gathered throughout the various
@@ -432,109 +565,19 @@ renameFiles ::
   TimeZone ->
   [FileDetails] ->
   AppT m [RenamedFile]
-renameFiles tz xs = do
-  -- Initialize tracking so that we can rename files that are "close" to files
-  -- we choose to rename. For example, so that FOO.JPG moves to BAR.JPG when
-  -- we rename FOO.CR3 to BAR.CR3. This association can happen either due to
-  -- both files having the same timestamp, or the same basename (which is
-  -- needed for files that have no capture timestamp, like XMP).
-  initSiblingTracking
-  reverse <$> foldrM go [] (M.toDescList entriesAtTime)
-  where
-    initSiblingTracking =
-      entriesAtBase
-        .= Prelude.foldl' (\m x -> addToList (x ^. filebase) x m) mempty xs
-
-    -- Mapping from YYmmddHHMMSS to a list of entries for that moment within
-    -- a given directory.
-    entriesAtTime :: Map UTCTime [FileDetails] =
-      Prelude.foldl'
-        ( \m x -> case x ^. captureTime of
-            Just tm -> addToList tm x m
-            Nothing -> m
-        )
-        mempty
-        xs
-
-    go (tm, entries) rest = do
-      entries' <-
-        if uniqueExts entries
-          then rename entries
-          else concatMapM (rename . (: [])) entries
-      pure $ entries' ++ rest
-      where
-        mkRenaming x nm ren = do
-          renamedEntries . at nm ?= ()
-          pure $ RenamedFile x nm ren
-
-        rename ents = do
-          base <- expectedBase
-          case ents of
-            [] -> pure []
-            e : es ->
-              (++)
-                <$> work (SimpleRename tm) base e []
-                <*> foldrM (work (FollowTime (e ^. filename)) base) [] es
-          where
-            work ren base details r
-              | named == details ^. filename = pure r
-              | otherwise = do
-                  rn <- mkRenaming details named (ren named)
-                  r' <- renameSiblings name details
-                  pure $ rn : r' ++ r
-              where
-                named = name details
-                name d = base <.> ext d
-                ext d = normalizeExt (d ^. fileext)
-
-            expectedBase =
-              newName (yymmdd tm') <$> nextSeqNum (yymmdd tm')
-              where
-                tm' = utcToLocalTime tz tm
-
-            newName base seqNum = base ++ "_" ++ printf "%04d" seqNum
-
-        renameSiblings name details = do
-          renamed <- use renamedEntries
-          preuse (entriesAtBase . ix (details ^. filebase))
-            >>= \case
-              Just
-                ( partition (\y -> y ^. fileext == details ^. fileext) ->
-                    (ys, zs)
-                  )
-                  | uniqueExts zs
-                      && not (any (\z -> name z `HS.member` renamed) zs) -> do
-                      entriesAtBase . at (details ^. filebase)
-                        %= \case
-                          Nothing -> Nothing
-                          Just _ ->
-                            let ws = filter (/= details) ys
-                             in case ws of
-                                  [] -> Nothing
-                                  _ -> Just ws
-                      mapM
-                        ( \z ->
-                            mkRenaming
-                              z
-                              (name z)
-                              ( FollowBase
-                                  (details ^. filename)
-                                  (name z)
-                              )
-                        )
-                        zs
-              _ -> pure []
+renameFiles tz ds =
+  removeNeedlessRenamings
+    . (\rs -> rs ++ siblingRenamings ds rs)
+    . removeNeedlessRenamings
+    <$> simpleRenamings tz ds
 
 {-------------------------------------------------------------------------
  - Step 6: Plan
  -}
 
-duplicatedElements :: (Ord a) => [a] -> [a]
-duplicatedElements =
-  nub . concat . filter ((> 1) . length) . group . sort
-
-uniqueExts :: [FileDetails] -> Bool
-uniqueExts = null . duplicatedElements . map (^. fileext)
+hasUniqueExts :: [FileDetails] -> Bool
+hasUniqueExts =
+  null . duplicatedElements . map (normalizeExt . (^. fileext))
 
 reportOverlaps ::
   (MonadIO m, MonadFail m) =>
@@ -543,36 +586,37 @@ reportOverlaps ::
   [(Int, Int, a)] ->
   [Int] ->
   AppT m ()
-reportOverlaps label f plan =
-  mapM_ $ \x ->
-    forM_ (filter (\p -> f p == x) plan) $ \(src, dst, _) -> do
-      preuse (idxToFilepath . ix src) >>= \case
-        Nothing ->
-          logErr $ "Failed to find path entry for source " ++ show src
-        Just (srcPath, _) ->
-          preuse (idxToFilepath . ix dst) >>= \case
-            Nothing ->
-              logErr $ "Failed to find path entry for dest " ++ show dst
-            Just (dstPath, _) ->
-              logErr $
-                "Overlapped "
-                  ++ label
-                  ++ ": "
-                  ++ srcPath
-                  ++ " -> "
-                  ++ dstPath
+reportOverlaps label f plan = mapM_ $ \x ->
+  forM_ (filter (\p -> f p == x) plan) $ \(src, dst, _) ->
+    preuse (idxToFilepath . ix src) >>= \case
+      Nothing ->
+        logErr $ "Failed to find path entry for source " ++ show src
+      Just (srcPath, _) ->
+        preuse (idxToFilepath . ix dst) >>= \case
+          Nothing ->
+            logErr $ "Failed to find path entry for dest " ++ show dst
+          Just (dstPath, _) ->
+            logErr $
+              "Overlapped "
+                ++ label
+                ++ ": "
+                ++ srcPath
+                ++ " -> "
+                ++ dstPath
 
 buildPlan ::
   (MonadIO m, MonadFail m) =>
   Maybe FilePath ->
   [RenamedFile] ->
   AppT m [(Int, Int, RenamedFile)]
-buildPlan destDir = safeguardPlan <=< foldrM go []
+buildPlan destDir rs = do
+  pid <- liftIO getCurrentPid
+  rs' <- foldrM go [] rs
+  safeguardPlan pid rs'
   where
     go ren rest
-      | ren ^. sourceDetails . filename == ren ^. renamedFile = do
-          logErr $ "Renaming file to itself: " ++ show ren
-          pure rest
+      | ren ^. sourceDetails . filename == ren ^. renamedFile =
+          error $ "Renaming file to itself: " ++ show ren
       | otherwise = do
           idx <-
             registerPath
@@ -582,24 +626,29 @@ buildPlan destDir = safeguardPlan <=< foldrM go []
               (ren ^. sourceDetails . checksum)
           pure $ (ren ^. sourceDetails . fileIdx, idx, ren) : rest
 
-    safeguardPlan plan = do
+    safeguardPlan pid plan = do
       reportOverlaps "src" (\(x, _, _) -> x) plan (duplicatedElements srcs)
       reportOverlaps "dst" (\(_, x, _) -> x) plan (duplicatedElements dsts)
-      foldrM work [] plan
+      uncurry (++) <$> foldrM work ([], []) plan
       where
         (srcs, dsts, _) = unzip3 plan
         srcs' = S.fromList srcs
-        work (src, dst, ren) rest
+        work (src, dst, ren) (rest, post)
           | dst `S.member` srcs' = do
               uniqueIdx <- nextUniqueNum
               Just (dstPath, csum) <- use (idxToFilepath . at dst)
               idx <-
                 registerPath
-                  (takeDirectory dstPath </> "tmp_" ++ show uniqueIdx)
+                  ( takeDirectory dstPath
+                      </> "tmp_"
+                      ++ show pid
+                      ++ "_"
+                      ++ show uniqueIdx
+                  )
                   csum
-              pure $ (src, idx, ren) : rest ++ [(idx, dst, ren)]
+              pure ((src, idx, ren) : rest, (idx, dst, ren) : post)
           | otherwise =
-              pure $ (src, dst, ren) : rest
+              pure ((src, dst, ren) : rest, post)
 
 {-------------------------------------------------------------------------
  - Step 7: Execute
@@ -646,32 +695,30 @@ safeMoveFile label src srcSum dst
       if shouldMove
         then do
           putStrLn_ Verbose $ src ++ label ++ dst
-          csum <- case srcSum of
-            Just csum -> pure csum
-            Nothing -> do
-              isFile <- liftIO $ doesFileExist src
-              -- This can be False if we are not in --execute mode, and the move
-              -- is from a temp file that was never created.
-              if isFile
-                then liftIO $ b3sum src
-                else pure ""
-          isFile <- liftIO $ doesFileExist dst
           dry <- not <$> view execute
-          if isFile
-            then do
-              csum' <- liftIO $ b3sum dst
-              if csum == csum'
-                then safeRemoveFile src
-                else
-                  unless dry $
-                    logErr $
-                      "Destination already exists: " ++ dst
-            else unless dry do
-              liftIO $ copyFileWithMetadata src dst
-              csum' <- liftIO $ b3sum dst
-              if csum == csum'
-                then safeRemoveFile src
-                else logErr $ "Checksum mismatch: " ++ csum ++ " != " ++ csum'
+          unless dry $ do
+            csum <- case srcSum of
+              Just csum -> pure csum
+              Nothing -> do
+                isFile <- liftIO $ doesFileExist src
+                -- This can be False if we are not in --execute mode, and the
+                -- move is from a temp file that was never created.
+                if isFile
+                  then liftIO $ b3sum src
+                  else pure ""
+            isFile <- liftIO $ doesFileExist dst
+            if isFile
+              then do
+                csum' <- liftIO $ b3sum dst
+                if csum == csum'
+                  then safeRemoveFile src
+                  else logErr $ "Destination already exists: " ++ dst
+              else do
+                liftIO $ copyFileWithMetadata src dst
+                csum' <- liftIO $ b3sum dst
+                if csum == csum'
+                  then safeRemoveFile src
+                  else logErr $ "Checksum mismatch: " ++ csum ++ " != " ++ csum'
         else do
           putStrLn_ Normal $ "INFO: Duplicate: " ++ src
           safeRemoveFile src
@@ -692,11 +739,14 @@ executePlan tz plan = do
         safeMoveFile (label (ren ^. renaming)) srcPath csum dstPath
       putStrLn_ Normal "Renaming complete!"
   where
+    formattedTime tm =
+      formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S%Q" tm'
+      where
+        tm' = utcToLocalTime tz tm
+
     label = \case
-      SimpleRename tm _ ->
-        let tm' = utcToLocalTime tz tm
-            fmt = formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S%Q" tm'
-         in " (" ++ fmt ++ ")-> "
+      SimpleRename tm _ -> " (" ++ formattedTime tm ++ ")-> "
+      SimpleRenameAvoidOverlap tm _ -> " (" ++ formattedTime tm ++ ")!> "
       FollowBase name _ -> " [" ++ name ++ "]-> "
       FollowTime name _ -> " {" ++ name ++ "}-> "
 
@@ -711,10 +761,12 @@ buildAndExecutePlan gather dirs mdest =
     doGatherDetails = do
       putStrLn_ Normal "Gathering details..."
       details <- sort <$> gatherDetails gather dirs
-      forM_ details $ \det ->
-        putStrLn_ Debug $
-          det ^. filepath
-            ++ maybe "" ((" @ " ++) . show) (det ^. captureTime)
+      d <- view debug
+      when d $
+        forM_ details $ \det ->
+          putStrLn_ Debug $
+            det ^. filepath
+              ++ maybe "" ((" @ " ++) . show) (det ^. captureTime)
       pure details
 
     doRenameFiles details = do
@@ -724,11 +776,13 @@ buildAndExecutePlan gather dirs mdest =
           ++ " entries)..."
       tz <- liftIO $ getTimeZone =<< getCurrentTime
       renamings <- renameFiles tz details
-      forM_ renamings $ \ren ->
-        putStrLn_ Debug $
-          ren ^. sourceDetails . filepath
-            ++ " >> "
-            ++ show (ren ^. renaming)
+      d <- view debug
+      when d $
+        forM_ renamings $ \ren ->
+          putStrLn_ Debug $
+            ren ^. sourceDetails . filepath
+              ++ " >> "
+              ++ show (ren ^. renaming)
       pure renamings
 
     doBuildPlan renamings = do
@@ -738,14 +792,14 @@ buildAndExecutePlan gather dirs mdest =
           ++ " renamings)..."
       plan <- buildPlan mdest renamings
       v <- view verbose
-      forM_ plan $ \(src, dst, ren) -> do
-        Just (srcPath, _) <- use (idxToFilepath . at src)
-        Just (dstPath, _) <- use (idxToFilepath . at dst)
-        putStrLn_ Debug $
-          srcPath ++ " >>> " ++ dstPath
-        when v $
-          liftIO $
-            pPrint ren
+      d <- view debug
+      when d $
+        forM_ plan $ \(src, dst, ren) -> do
+          Just (srcPath, _) <- use (idxToFilepath . at src)
+          Just (dstPath, _) <- use (idxToFilepath . at dst)
+          putStrLn_ Debug $
+            srcPath ++ " >>> " ++ dstPath
+          when v $ liftIO $ pPrint ren
       pure plan
 
     doExecutePlan plan = do
@@ -753,11 +807,10 @@ buildAndExecutePlan gather dirs mdest =
       executePlan tz plan
 
 renamePhotos :: [FilePath] -> AppT IO ()
-renamePhotos dirs = buildAndExecutePlan True dirs Nothing
+renamePhotos = buildAndExecutePlan True ?? Nothing
 
 importPhotos :: [FilePath] -> FilePath -> [FilePath] -> AppT IO ()
 importPhotos froms toPath dirs = do
-  -- Gather details to determine daily sequence numbers, checksums, etc.
   _ <- gatherDetails True dirs
   buildAndExecutePlan False froms (Just toPath)
   mapM_ safePruneDirectory froms
@@ -783,6 +836,7 @@ summary =
 main :: IO ()
 main = do
   opts <- getOptions
+  _ <- GHC.Conc.setNumCapabilities (opts ^. jobs)
   errors <- runAppT opts $ do
     case opts ^. command of
       RenamePhotos dirs ->
@@ -820,6 +874,13 @@ main = do
           ( short 'd'
               <> long "debug"
               <> help "Report progress at debug level"
+          )
+        <*> option
+          auto
+          ( short 'j'
+              <> long "jobs"
+              <> value 1
+              <> help "Number of concurrent IO jobs (default: 1)"
           )
         <*> switch
           ( long "checksum"
