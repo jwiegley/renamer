@@ -31,6 +31,19 @@ dependencies:
   - transformers         >= 0.3
   - unordered-containers >= 0.2
 
+tests:
+  renamer-tests:
+    main: Main.hs
+    source-dirs: tests
+    dependencies:
+      - HUnit
+      - hedgehog
+      - here
+      - tasty
+      - tasty-hedgehog
+      - tasty-hunit
+      - renamer
+
 executables:
   renamer:
     main: Main.hs

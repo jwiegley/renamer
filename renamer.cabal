@@ -42,3 +42,35 @@ executable renamer
     , transformers >=0.3
     , unordered-containers >=0.2
   default-language: Haskell2010
+
+test-suite renamer-tests
+  type: exitcode-stdio-1.0
+  main-is: Main.hs
+  other-modules:
+      Paths_renamer
+  hs-source-dirs:
+      tests
+  ghc-options: -Wall -Wno-missing-home-modules -fprof-auto
+  build-depends:
+      HUnit
+    , aeson
+    , base >=4.7
+    , containers >=0.6
+    , directory
+    , filepath
+    , hedgehog
+    , here
+    , lens >=4.9
+    , optparse-applicative >=0.10
+    , parallel-io
+    , pretty-show
+    , process
+    , regex-tdfa
+    , renamer
+    , tasty
+    , tasty-hedgehog
+    , tasty-hunit
+    , time >=1.4
+    , transformers >=0.3
+    , unordered-containers >=0.2
+  default-language: Haskell2010
