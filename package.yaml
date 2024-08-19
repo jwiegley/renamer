@@ -22,7 +22,6 @@ dependencies:
   - directory
   - filepath
   - lens                 >= 4.9
-  - optparse-applicative >= 0.10
   - parallel-io
   - pretty-show
   - process
@@ -30,6 +29,11 @@ dependencies:
   - time                 >= 1.4
   - transformers         >= 0.3
   - unordered-containers >= 0.2
+
+library:
+  source-dirs: src
+  exposed-modules:
+    - Renamer
 
 tests:
   renamer-tests:
@@ -47,4 +51,8 @@ tests:
 executables:
   renamer:
     main: Main.hs
+    source-dirs: bin
     ghc-options: -threaded -rtsopts -with-rtsopts=-N
+    dependencies:
+      - renamer
+      - optparse-applicative

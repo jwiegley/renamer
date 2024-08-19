@@ -21,10 +21,36 @@ source-repository head
   type: git
   location: https://github.com/jwiegley/renamer
 
+library
+  exposed-modules:
+      Renamer
+  other-modules:
+      Paths_renamer
+  hs-source-dirs:
+      src
+  ghc-options: -Wall -Wno-missing-home-modules -fprof-auto
+  build-depends:
+      aeson
+    , base >=4.7
+    , containers >=0.6
+    , directory
+    , filepath
+    , lens >=4.9
+    , parallel-io
+    , pretty-show
+    , process
+    , regex-tdfa
+    , time >=1.4
+    , transformers >=0.3
+    , unordered-containers >=0.2
+  default-language: Haskell2010
+
 executable renamer
   main-is: Main.hs
   other-modules:
       Paths_renamer
+  hs-source-dirs:
+      bin
   ghc-options: -Wall -Wno-missing-home-modules -fprof-auto -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       aeson
@@ -33,11 +59,12 @@ executable renamer
     , directory
     , filepath
     , lens >=4.9
-    , optparse-applicative >=0.10
+    , optparse-applicative
     , parallel-io
     , pretty-show
     , process
     , regex-tdfa
+    , renamer
     , time >=1.4
     , transformers >=0.3
     , unordered-containers >=0.2
@@ -61,7 +88,6 @@ test-suite renamer-tests
     , hedgehog
     , here
     , lens >=4.9
-    , optparse-applicative >=0.10
     , parallel-io
     , pretty-show
     , process
