@@ -13,7 +13,7 @@ module Main where
 
 import Control.Concurrent.ParallelIO
 import Control.Lens hiding ((<.>))
-import Control.Monad (unless, when)
+import Control.Monad (filterM, unless, when)
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Reader
@@ -30,9 +30,6 @@ import Data.List (group, nub, partition, sort)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
 import Data.Time
--- import Debug.Trace
-
-import Data.Traversable (forM)
 import GHC.Conc (setNumCapabilities)
 import GHC.Generics (Generic)
 import Options.Applicative hiding (command)
@@ -297,8 +294,8 @@ exiv2ImageTimestamp path = do
       ""
   case ec of
     ExitSuccess ->
-      Just
-        <$> parseTimeM
+      pure $
+        parseTimeM
           False
           defaultTimeLocale
           "%0Y:%0m:%0d %0H:%0M:%0S\n"
@@ -314,8 +311,8 @@ exiftoolImageTimestamp path = do
       ""
   case ec of
     ExitSuccess ->
-      Just
-        <$> parseTimeM
+      pure $
+        parseTimeM
           False
           defaultTimeLocale
           "Date/Time Original              : %0Y:%0m:%0d %0H:%0M:%0S%Q%Ez\n"
@@ -442,7 +439,7 @@ normalizeExt ext = case strToLower ext of
 siblingRenamings ::
   [FileDetails] ->
   [RenamedFile] ->
-  [Either String RenamedFile]
+  [RenamedFile]
 siblingRenamings xs rs = evalState (concatMapM go rs) (renamedFrom, renamedTo)
   where
     siblings :: HashMap FilePath [FileDetails]
@@ -452,7 +449,7 @@ siblingRenamings xs rs = evalState (concatMapM go rs) (renamedFrom, renamedTo)
     renamedFrom :: HashSet FilePath
     renamedFrom =
       Prelude.foldl'
-        (\m (RenamedFile d _ _) -> m & at (d ^. filename) ?~ ())
+        (\m (RenamedFile d _ _) -> m & at (d ^. filepath) ?~ ())
         mempty
         rs
 
@@ -460,46 +457,46 @@ siblingRenamings xs rs = evalState (concatMapM go rs) (renamedFrom, renamedTo)
     renamedTo =
       Prelude.foldl' (\m (RenamedFile _ nm _) -> m & at nm ?~ ()) mempty rs
 
-    go (RenamedFile details newname _) =
+    go (RenamedFile details newname _ren) =
       case siblings
         ^? ix (details ^. filebase)
           . to (partition (\y -> y ^. fileext == details ^. fileext)) of
         Just (ys, zs)
-          | ys == [details] && hasUniqueExts zs ->
-              mapM
-                ( \z -> do
-                    (renFrom, renTo) <- get
-                    if (z ^. filename) `HS.member` renFrom
-                      then
-                        pure $
-                          Left $
-                            "WARNING: Already renamed from source: "
-                              ++ z ^. filename
-                              ++ " -> "
-                              ++ name z
-                      else
-                        if name z `HS.member` renTo
-                          then
-                            pure $
-                              Left $
-                                "WARNING: Already renamed to target: "
-                                  ++ z ^. filename
-                                  ++ " -> "
-                                  ++ name z
-                          else do
-                            let ren =
-                                  RenamedFile
-                                    z
-                                    (name z)
-                                    ( FollowBase
-                                        (details ^. filename)
-                                        (name z)
-                                    )
-                            _1 . at (z ^. filename) ?= ()
-                            _2 . at (name z) ?= ()
-                            pure $ Right ren
+          | ys == [details]
+              && not (null zs)
+              && hasUniqueExts zs
+              && all
+                ( \z -> case z ^. captureTime of
+                    Nothing -> True
+                    tm -> tm == details ^. captureTime
                 )
-                zs
+                zs ->
+              fmap
+                ( Prelude.map
+                    ( \z ->
+                        RenamedFile
+                          z
+                          (name z)
+                          ( FollowBase
+                              (details ^. filepath)
+                              (name z)
+                          )
+                    )
+                )
+                ( filterM
+                    ( \z -> do
+                        renFrom <- use _1
+                        renTo <- use _2
+                        _1 . at (z ^. filepath) ?= ()
+                        _2 . at (name z) ?= ()
+                        pure $
+                          not
+                            ( (z ^. filepath) `HS.member` renFrom
+                                || name z `HS.member` renTo
+                            )
+                    )
+                    zs
+                )
         _ -> pure []
       where
         base = takeBaseName newname
@@ -563,6 +560,14 @@ removeNeedlessRenamings :: [RenamedFile] -> [RenamedFile]
 removeNeedlessRenamings =
   filter (\ren -> ren ^. sourceDetails . filename /= ren ^. renamedFile)
 
+dischargeMessages ::
+  (MonadIO m) =>
+  [Either String a] ->
+  AppT m [a]
+dischargeMessages = concatMapM $ \case
+  Right x -> pure [x]
+  Left msg -> [] <$ putStrLn_ Normal msg
+
 -- | Determine the ideal name for a given photo, in the context of the
 --   repository where it is meant to abide. Note that this function is called
 --   only after all file details have been gathered throughout the various
@@ -584,13 +589,7 @@ renameFiles ::
   AppT m [RenamedFile]
 renameFiles tz ds = do
   rs <- removeNeedlessRenamings <$> simpleRenamings tz ds
-  removeNeedlessRenamings <$> go rs
-  where
-    go rs = do
-      rss' <- forM (siblingRenamings ds rs) $ \case
-        Right ren -> pure [ren]
-        Left msg -> [] <$ putStrLn_ Normal msg
-      pure $ rs ++ concat rss'
+  pure $ removeNeedlessRenamings $ rs ++ siblingRenamings ds rs
 
 {-------------------------------------------------------------------------
  - Step 6: Plan
