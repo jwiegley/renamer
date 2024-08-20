@@ -12,7 +12,7 @@ module Renamer where
 import Control.Applicative
 import Control.Concurrent.ParallelIO qualified as PIO
 import Control.Lens hiding ((<.>))
-import Control.Monad (filterM, unless, when)
+import Control.Monad (unless, when)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Reader
 import Control.Monad.Trans.State
@@ -22,10 +22,11 @@ import Data.Char (toLower)
 import Data.Foldable (foldrM, forM_)
 import Data.HashMap.Strict (HashMap)
 import Data.HashSet (HashSet)
-import Data.HashSet qualified as HS
 import Data.IntMap.Strict (IntMap)
 import Data.IntSet qualified as S
-import Data.List (group, nub, partition, sort)
+import Data.List (group, nub, partition, sort, sortOn)
+import Data.List.NonEmpty qualified as NE
+import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
 import Data.Time
 import GHC.Generics (Generic)
@@ -523,30 +524,19 @@ normalizeExt ext = case strToLower ext of
 --   association can happen either due to both files having the same
 --   timestamp, or the same basename (which is needed for files that have no
 --   capture timestamp, like XMP).
-siblingRenamings ::
-  [FileDetails] ->
-  [RenamedFile] ->
-  [RenamedFile]
-siblingRenamings xs rs = evalState (concatMapM go rs) (renamedFrom, renamedTo)
+siblingRenamings :: [FileDetails] -> [RenamedFile] -> [RenamedFile]
+siblingRenamings xs = concatMap go
   where
-    siblings :: HashMap FilePath [FileDetails]
+    siblings :: HashMap (FilePath, FilePath) [FileDetails]
     siblings =
-      Prelude.foldl' (\m x -> addToList (x ^. filebase) x m) mempty xs
-
-    renamedFrom :: HashSet FilePath
-    renamedFrom =
       Prelude.foldl'
-        (\m (RenamedFile d _ _) -> m & at (d ^. filepath) ?~ ())
+        (\m x -> addToList (x ^. filedir, x ^. filebase) x m)
         mempty
-        rs
-
-    renamedTo :: HashSet FilePath
-    renamedTo =
-      Prelude.foldl' (\m (RenamedFile _ nm _) -> m & at nm ?~ ()) mempty rs
+        xs
 
     go (RenamedFile details newname _ren) =
       case siblings
-        ^? ix (details ^. filebase)
+        ^? ix (details ^. filedir, details ^. filebase)
           . to (partition (\y -> y ^. fileext == details ^. fileext)) of
         Just (ys, zs)
           | ys == [details]
@@ -558,30 +548,15 @@ siblingRenamings xs rs = evalState (concatMapM go rs) (renamedFrom, renamedTo)
                     tm -> tm == details ^. captureTime
                 )
                 zs ->
-              fmap
-                ( Prelude.map
-                    ( \z ->
-                        RenamedFile
-                          z
-                          (name z)
-                          (FollowBase (details ^. filepath))
-                    )
+              Prelude.map
+                ( \z ->
+                    RenamedFile
+                      z
+                      (name z)
+                      (FollowBase (details ^. filepath))
                 )
-                ( filterM
-                    ( \z -> do
-                        renFrom <- use _1
-                        renTo <- use _2
-                        _1 . at (z ^. filepath) ?= ()
-                        _2 . at (name z) ?= ()
-                        pure $
-                          not
-                            ( (z ^. filepath) `HS.member` renFrom
-                                || name z `HS.member` renTo
-                            )
-                    )
-                    zs
-                )
-        _ -> pure []
+                zs
+        _ -> []
       where
         base = takeBaseName newname
         name d = base <.> ext d
@@ -603,15 +578,22 @@ simpleRenamings ::
   TimeZone ->
   [FileDetails] ->
   AppT m [RenamedFile]
-simpleRenamings tz = do
-  fmap reverse
-    . foldrM go []
-    . M.toDescList
-    . Prelude.foldl'
-      (\m x -> maybe m (\tm -> addToList tm x m) (x ^. captureTime))
-      mempty
+simpleRenamings tz =
+  fmap reverse . foldrM go [] . M.toDescList . contemporaries
   where
-    go (tm, entries) rest = do
+    contemporaries ::
+      [FileDetails] -> Map (FilePath, UTCTime) [FileDetails]
+    contemporaries =
+      Prelude.foldl'
+        ( \m x ->
+            maybe
+              m
+              (\tm -> addToList (x ^. filedir, tm) x m)
+              (x ^. captureTime)
+        )
+        mempty
+
+    go ((_dir, tm), entries) rest = do
       entries' <-
         if hasUniqueExts entries
           then rename (SimpleRename tm) entries
@@ -640,27 +622,41 @@ simpleRenamings tz = do
                 newName base seqNum = base ++ "_" ++ printf "%04d" seqNum
 
 -- | Entries that would rename a file to itself.
-needlessRenaming :: Maybe FilePath -> RenamedFile -> Bool
-needlessRenaming destDir ren = ren ^. source == target destDir ren
+idempotentRenaming :: Maybe FilePath -> RenamedFile -> Bool
+idempotentRenaming destDir ren = ren ^. source == target destDir ren
 
-reportNeedlessRenamings ::
+reportIdempotentRenamings ::
   (MonadLog m) =>
   Maybe FilePath ->
   [RenamedFile] ->
   AppT m ()
-reportNeedlessRenamings destDir rs =
-  forM_ (filter (needlessRenaming destDir) rs) $ \ren ->
+reportIdempotentRenamings destDir rs =
+  forM_ (filter (idempotentRenaming destDir) rs) $ \ren ->
     logErr $
       "Renaming file to itself: " ++ show ren
 
-overlappedSources ::
-  Maybe FilePath ->
-  [RenamedFile] ->
-  [(FilePath, FilePath)]
-overlappedSources destDir rs = do
+redundantRenaming :: Maybe FilePath -> RenamedFile -> RenamedFile -> Bool
+redundantRenaming destDir rx ry =
+  rx ^. source == ry ^. source && target destDir rx == target destDir ry
+
+removeRedundantSourceRenamings ::
+  Maybe FilePath -> [RenamedFile] -> [RenamedFile]
+removeRedundantSourceRenamings destDir rs =
+  Prelude.map
+    NE.head
+    (NE.groupBy (redundantRenaming destDir) (sortOn (^. source) rs))
+
+removeRedundantTargetRenamings ::
+  Maybe FilePath -> [RenamedFile] -> [RenamedFile]
+removeRedundantTargetRenamings destDir rs =
+  Prelude.map
+    NE.head
+    (NE.groupBy (redundantRenaming destDir) (sortOn (target destDir) rs))
+
+overlappedSources :: [RenamedFile] -> [(FilePath, [RenamedFile])]
+overlappedSources rs = do
   nm <- duplicatedElements (Prelude.map (^. source) rs)
-  ren <- filter ((== nm) . (^. source)) rs
-  pure (nm, target destDir ren)
+  pure (nm, filter ((== nm) . (^. source)) rs)
 
 reportOverlappedSources ::
   (MonadLog m) =>
@@ -668,17 +664,17 @@ reportOverlappedSources ::
   [RenamedFile] ->
   AppT m ()
 reportOverlappedSources destDir rs =
-  forM_ (overlappedSources destDir rs) $ \(src, dst) ->
-    logErr $ "Overlapped source: " ++ src ++ " -> " ++ dst
+  forM_ (overlappedSources rs) $ \(src, dsts) ->
+    forM_ dsts $ \dst ->
+      logErr $ "Overlapped source: " ++ src ++ " -> " ++ target destDir dst
 
 overlappedTargets ::
   Maybe FilePath ->
   [RenamedFile] ->
-  [(FilePath, FilePath)]
+  [(FilePath, [RenamedFile])]
 overlappedTargets destDir rs = do
   nm <- duplicatedElements (Prelude.map (target destDir) rs)
-  ren <- filter ((== nm) . target destDir) rs
-  pure (ren ^. source, nm)
+  pure (nm, filter ((== nm) . target destDir) rs)
 
 reportOverlappedTargets ::
   (MonadLog m) =>
@@ -686,16 +682,9 @@ reportOverlappedTargets ::
   [RenamedFile] ->
   AppT m ()
 reportOverlappedTargets destDir rs =
-  forM_ (overlappedTargets destDir rs) $ \(src, dst) ->
-    logErr $ "Overlapped target: " ++ src ++ " -> " ++ dst
-
-dischargeMessages ::
-  (MonadLog m) =>
-  [Either String a] ->
-  AppT m [a]
-dischargeMessages = concatMapM $ \case
-  Right x -> pure [x]
-  Left msg -> [] <$ putStrLn_ Normal msg
+  forM_ (overlappedTargets destDir rs) $ \(dst, srcs) ->
+    forM_ srcs $ \src ->
+      logErr $ "Overlapped target: " ++ src ^. source ++ " -> " ++ dst
 
 -- | Determine the ideal name for a given photo, in the context of the
 --   repository where it is meant to abide. Note that this function is called
@@ -706,11 +695,11 @@ dischargeMessages = concatMapM $ \case
 --
 --   2. It should contain the sequence of which photo it was that day.
 --
---   3. jww (2024-08-13): If there are two files with the same basename but
---      different extensions, they should be renamed together.
+--   3. If there are two files with the same basename but different
+--      extensions, they should be renamed together.
 --
---   4. jww (2024-08-13): If it is the alternate version (different extension)
---      of an existing photo, it should share the sequence number.
+--   4. If it is the alternate version (different extension) of an existing
+--      photo, it should share the sequence number.
 renameFiles ::
   (Monad m) =>
   TimeZone ->
@@ -718,8 +707,12 @@ renameFiles ::
   [FileDetails] ->
   AppT m [RenamedFile]
 renameFiles tz destDir ds = do
-  rs <- filter (not . needlessRenaming destDir) <$> simpleRenamings tz ds
-  pure $ filter (not . needlessRenaming destDir) $ rs ++ siblingRenamings ds rs
+  rs <- filter (not . idempotentRenaming destDir) <$> simpleRenamings tz ds
+  pure $
+    -- removeRedundantTargetRenamings destDir $
+    removeRedundantSourceRenamings destDir $
+      filter (not . idempotentRenaming destDir) $
+        rs ++ siblingRenamings ds rs
 
 {-------------------------------------------------------------------------
  - Step 6: Plan
@@ -735,9 +728,10 @@ buildPlan ::
   [RenamedFile] ->
   AppT m [(Int, Int, RenamedFile)]
 buildPlan destDir rs = do
-  reportNeedlessRenamings destDir rs
+  reportIdempotentRenamings destDir rs
   reportOverlappedSources destDir rs
   reportOverlappedTargets destDir rs
+
   pid <- lift $ lift $ getCurrentPid
   rs' <- foldrM go [] rs
   safeguardPlan pid rs'
@@ -820,7 +814,7 @@ safeMoveFile label src srcSum dst
         Nothing -> pure True
       if shouldMove
         then do
-          putStrLn_ Verbose $ src ++ label ++ dst
+          putStrLn_ Normal $ src ++ label ++ dst
           dry <- not <$> view execute
           unless dry $ do
             csum <- case srcSum of
