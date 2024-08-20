@@ -34,10 +34,10 @@ summary =
 
 main :: IO ()
 main = do
-  opts <- getOptions
+  (opts, cmd) <- getOptions
   _ <- GHC.Conc.setNumCapabilities (opts ^. jobs)
   errors <- runAppT opts $ do
-    case opts ^. command of
+    case cmd of
       RenamePhotos dirs ->
         renamePhotos dirs
       ImportPhotos froms toPath dirs ->
@@ -47,14 +47,54 @@ main = do
     then exitSuccess
     else exitWith (ExitFailure errors)
   where
-    getOptions :: IO Options
+    getOptions :: IO (Options, Command)
     getOptions = execParser optionsDefinition
       where
-        optionsDefinition :: ParserInfo Options
+        optionsDefinition :: ParserInfo (Options, Command)
         optionsDefinition =
           info
-            (helper <*> renamerOptions)
+            ( helper
+                <*> ( (,)
+                        <$> renamerOptions
+                        <*> hsubparser
+                          ( importCommand
+                              <> renameCommand
+                          )
+                    )
+            )
             (fullDesc <> progDesc "" <> header summary)
+
+        importCommand :: Mod CommandFields Command
+        importCommand =
+          OA.command
+            "import"
+            (info importOptions (progDesc "Import photos"))
+          where
+            importOptions :: Parser Command
+            importOptions =
+              ImportPhotos
+                <$> some
+                  ( OA.strOption
+                      ( long "from"
+                          <> help "Entries to move into --to directory"
+                      )
+                  )
+                <*> OA.strOption
+                  ( long "to"
+                      <> help "Directory to move --from entries into"
+                  )
+                <*> some (OA.argument str (metavar "ENTRIES"))
+
+        renameCommand :: Mod CommandFields Command
+        renameCommand =
+          OA.command
+            "rename"
+            (info renameOptions (progDesc "Rename photos"))
+          where
+            renameOptions :: Parser Command
+            renameOptions =
+              RenamePhotos
+                <$> some (OA.argument str (metavar "ENTRIES"))
 
     renamerOptions :: Parser Options
     renamerOptions =
@@ -93,42 +133,6 @@ main = do
           ( long "keep-state"
               <> help "Keep state in .file-details.json (to aid debugging)"
           )
-        <*> hsubparser
-          ( importCommand
-              <> renameCommand
-          )
-      where
-        importCommand :: Mod CommandFields Command
-        importCommand =
-          OA.command
-            "import"
-            (info importOptions (progDesc "Import photos"))
-          where
-            importOptions :: Parser Command
-            importOptions =
-              ImportPhotos
-                <$> some
-                  ( OA.strOption
-                      ( long "from"
-                          <> help "Entries to move into --to directory"
-                      )
-                  )
-                <*> OA.strOption
-                  ( long "to"
-                      <> help "Directory to move --from entries into"
-                  )
-                <*> some (OA.argument str (metavar "ENTRIES"))
-
-        renameCommand :: Mod CommandFields Command
-        renameCommand =
-          OA.command
-            "rename"
-            (info renameOptions (progDesc "Rename photos"))
-          where
-            renameOptions :: Parser Command
-            renameOptions =
-              RenamePhotos
-                <$> some (OA.argument str (metavar "ENTRIES"))
 
 buildAndExecutePlan :: Bool -> [FilePath] -> Maybe FilePath -> AppT IO ()
 buildAndExecutePlan gather dirs mdest =

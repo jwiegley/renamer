@@ -9,14 +9,14 @@
 module Renamer where
 
 import Control.Applicative
-import Control.Concurrent.ParallelIO
+import Control.Concurrent.ParallelIO qualified as PIO
 import Control.Lens hiding ((<.>))
 import Control.Monad (filterM, unless, when)
-import Control.Monad.IO.Class
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Reader
 import Control.Monad.Trans.State
-import Data.Aeson hiding (Options, (.=))
+import Data.Aeson hiding (Options, decodeFileStrict, encodeFile, (.=))
+import Data.Aeson qualified as JSON
 import Data.Char (toLower)
 import Data.Foldable (foldrM, forM_)
 import Data.HashMap.Strict (HashMap)
@@ -29,10 +29,11 @@ import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
 import Data.Time
 import GHC.Generics (Generic)
-import System.Directory
+import System.Directory qualified as Dir
 import System.Exit
 import System.FilePath
-import System.Process
+import System.Process (Pid, readProcessWithExitCode)
+import System.Process qualified as Proc
 import Text.Printf
 import Text.Regex.TDFA
 import Text.Regex.TDFA.String ()
@@ -101,10 +102,10 @@ getTime d = fromMaybe (d ^. fileModTime) (d ^. captureTime)
 type DetailsMap = HashMap FilePath FileDetails
 
 data Renaming
-  = SimpleRename UTCTime FilePath
-  | SimpleRenameAvoidOverlap UTCTime FilePath
-  | FollowBase FilePath FilePath
-  | FollowTime FilePath FilePath
+  = SimpleRename UTCTime
+  | SimpleRenameAvoidOverlap UTCTime
+  | FollowBase FilePath
+  | FollowTime FilePath
   deriving (Eq, Show)
 
 makePrisms ''Renaming
@@ -178,16 +179,33 @@ data Options = Options
     _jobs :: !Int,
     _checksums :: !Bool,
     _execute :: !Bool,
-    _keepState :: !Bool,
-    _command :: Command
+    _keepState :: !Bool
   }
   deriving (Show, Eq)
 
 makeLenses ''Options
 
-logErr :: (MonadIO m) => String -> AppT m ()
+defaultOptions :: Options
+defaultOptions =
+  Options
+    { _quiet = False,
+      _verbose = False,
+      _debug = False,
+      _jobs = 1,
+      _checksums = False,
+      _execute = False,
+      _keepState = False
+    }
+
+class (Monad m) => MonadLog m where
+  printLog :: String -> m ()
+
+instance MonadLog IO where
+  printLog = Pre.putStrLn
+
+logErr :: (MonadLog m) => String -> AppT m ()
 logErr msg = do
-  liftIO $ Pre.putStrLn $ "ERROR: " ++ msg
+  lift $ lift $ printLog $ "ERROR: " ++ msg
   errorCount += 1
 
 data Verbosity
@@ -195,7 +213,7 @@ data Verbosity
   | Verbose
   | Debug
 
-putStrLn_ :: (MonadIO m) => Verbosity -> String -> AppT m ()
+putStrLn_ :: (MonadLog m) => Verbosity -> String -> AppT m ()
 putStrLn_ verb s = do
   q <- view quiet
   v <- view verbose
@@ -206,8 +224,9 @@ putStrLn_ verb s = do
         Verbose -> d || v
         Normal -> True
     )
-    $ liftIO
-    $ Pre.putStrLn s
+    $ lift
+    $ lift
+    $ printLog s
 
 type AppT m = ReaderT Options (StateT RenamerState m)
 
@@ -267,6 +286,34 @@ registerCounter path = case path =~ nameRe of
  - Step 4: Analyze
  -}
 
+class (Monad m) => MonadProc m where
+  getCurrentPid :: m Pid
+
+instance MonadProc IO where
+  getCurrentPid = Proc.getCurrentPid
+
+class (Monad m) => MonadParallel m where
+  parallelInterleaved :: [m a] -> m [a]
+  stopGlobalPool :: m ()
+
+instance MonadParallel IO where
+  parallelInterleaved = PIO.parallelInterleaved
+  stopGlobalPool = PIO.stopGlobalPool
+
+class (Monad m) => MonadChecksum m where
+  fileChecksum :: FilePath -> m String
+
+instance MonadChecksum IO where
+  fileChecksum = b3sum
+
+class (Monad m) => MonadPhoto m where
+  photoCaptureDate :: FilePath -> m (Maybe UTCTime)
+
+instance MonadPhoto IO where
+  photoCaptureDate path =
+    exiftoolImageTimestamp path
+      <|> exiv2ImageTimestamp path
+
 b3sum :: FilePath -> IO String
 b3sum path = do
   (ec, out, err) <-
@@ -313,15 +360,49 @@ exiftoolImageTimestamp path = do
           out
     ExitFailure _code -> pure Nothing
 
-getFileDetails :: Bool -> FilePath -> IO FileDetails
+class (Monad m) => MonadFS m where
+  listDirectory :: FilePath -> m [FilePath]
+  doesFileExist :: FilePath -> m Bool
+  doesDirectoryExist :: FilePath -> m Bool
+  getModificationTime :: FilePath -> m UTCTime
+  getFileSize :: FilePath -> m Integer
+  removeFile :: FilePath -> m ()
+  removeDirectory :: FilePath -> m ()
+  renameFile :: FilePath -> FilePath -> m ()
+  copyFileWithMetadata :: FilePath -> FilePath -> m ()
+
+instance MonadFS IO where
+  listDirectory = Dir.listDirectory
+  doesFileExist = Dir.doesFileExist
+  doesDirectoryExist = Dir.doesDirectoryExist
+  getModificationTime = Dir.getModificationTime
+  getFileSize = Dir.getFileSize
+  removeFile = Dir.removeFile
+  removeDirectory = Dir.removeDirectory
+  renameFile = Dir.renameFile
+  copyFileWithMetadata = Dir.copyFileWithMetadata
+
+class (Monad m) => MonadJSON m where
+  decodeFileStrict :: (FromJSON a) => FilePath -> m (Maybe a)
+  encodeFile :: (ToJSON a) => FilePath -> a -> m ()
+
+instance MonadJSON IO where
+  decodeFileStrict = JSON.decodeFileStrict
+  encodeFile = JSON.encodeFile
+
+getFileDetails ::
+  (Alternative m, MonadChecksum m, MonadPhoto m, MonadFS m) =>
+  Bool ->
+  FilePath ->
+  m FileDetails
 getFileDetails computeChecksum path = do
-  isFile <- liftIO $ doesFileExist path
+  isFile <- doesFileExist path
   unless isFile $
     error $
       "File does not exist: " ++ path
   _checksum <-
     if computeChecksum
-      then liftIO $ Just <$> b3sum path
+      then Just <$> fileChecksum path
       else pure Nothing
   let _filepath = path
       _filedir = takeDirectory path
@@ -330,17 +411,14 @@ getFileDetails computeChecksum path = do
       _fileext = takeExtension path
   _captureTime <-
     if isImage _fileext
-      then
-        liftIO $
-          exiftoolImageTimestamp path
-            <|> exiv2ImageTimestamp path
+      then photoCaptureDate path
       else pure Nothing
   let _fileIdx = -1
-  _fileModTime <- liftIO $ getModificationTime path
-  _fileSize <- liftIO $ getFileSize path
+  _fileModTime <- getModificationTime path
+  _fileSize <- getFileSize path
   pure FileDetails {..}
 
-registerFileDetails :: Bool -> FileDetails -> AppT IO FileDetails
+registerFileDetails :: (Monad m) => Bool -> FileDetails -> AppT m FileDetails
 registerFileDetails gather FileDetails {..} = do
   when gather $
     registerCounter _filepath
@@ -348,22 +426,33 @@ registerFileDetails gather FileDetails {..} = do
   pure FileDetails {..}
 
 walkFileEntries ::
-  (MonadIO m) =>
+  (MonadFS m, MonadLog m) =>
   (FilePath -> m a) ->
   FilePath ->
   m [m a]
 walkFileEntries f path = do
-  isDir <- liftIO $ doesDirectoryExist path
+  isDir <- doesDirectoryExist path
   if isDir
     then do
-      liftIO $ Pre.putStrLn $ "Gathering details from " ++ show path
+      printLog $ "Gathering details from " ++ show path
       concatMapM (walkFileEntries f . (path </>))
-        =<< liftIO (listDirectory path)
+        =<< listDirectory path
     else pure [f path]
 
 -- | Takes a list of files and/or directories, and gathers file details for
 --   all files involved, recursively.
-gatherDetails :: Bool -> [FilePath] -> AppT IO [FileDetails]
+gatherDetails ::
+  ( MonadLog m,
+    MonadFS m,
+    MonadJSON m,
+    MonadParallel m,
+    MonadChecksum m,
+    MonadPhoto m,
+    Alternative m
+  ) =>
+  Bool ->
+  [FilePath] ->
+  AppT m [FileDetails]
 gatherDetails gather = concatMapM $ \entry -> do
   -- Get info on all entries; this is stateful and builds up the following
   -- tables:
@@ -371,16 +460,16 @@ gatherDetails gather = concatMapM $ \entry -> do
   --   idxToFilepath
   --   fileChecksums
   c <- view checksums
-  isDir <- liftIO $ doesDirectoryExist entry
+  isDir <- lift $ lift $ doesDirectoryExist entry
   details <-
     if isDir
       then do
         let detailsFile = entry </> ".file-details.json"
-        isFile <- liftIO $ doesFileExist detailsFile
+        isFile <- lift $ lift $ doesFileExist detailsFile
         stateful <- view keepState
         mres <-
           if stateful && isFile
-            then liftIO $ decodeFileStrict detailsFile
+            then lift $ lift $ decodeFileStrict detailsFile
             else pure Nothing
         case mres of
           Just (details, st) -> do
@@ -388,15 +477,18 @@ gatherDetails gather = concatMapM $ \entry -> do
             pure details
           Nothing -> do
             details <-
-              liftIO $
-                parallelInterleaved =<< walkFileEntries (getFileDetails c) entry
+              lift $
+                lift $
+                  parallelInterleaved
+                    =<< walkFileEntries (getFileDetails c) entry
             st <- lift get
-            liftIO $ encodeFile detailsFile (details, st)
+            lift $ lift $ encodeFile detailsFile (details, st)
             pure details
       else
-        liftIO $
-          parallelInterleaved =<< walkFileEntries (getFileDetails c) entry
-  liftIO stopGlobalPool
+        lift $
+          lift $
+            parallelInterleaved =<< walkFileEntries (getFileDetails c) entry
+  lift $ lift stopGlobalPool
   mapM (registerFileDetails gather) details
 
 {-------------------------------------------------------------------------
@@ -471,10 +563,7 @@ siblingRenamings xs rs = evalState (concatMapM go rs) (renamedFrom, renamedTo)
                         RenamedFile
                           z
                           (name z)
-                          ( FollowBase
-                              (details ^. filepath)
-                              (name z)
-                          )
+                          (FollowBase (details ^. filepath))
                     )
                 )
                 ( filterM
@@ -538,7 +627,7 @@ simpleRenamings tz = do
             work f base e []
               ++ foldr (work (FollowTime (e ^. filename)) base) [] es
           where
-            work ren base details = (RenamedFile details named (ren named) :)
+            work ren base details = (RenamedFile details named ren :)
               where
                 named = name details
                 name d = base <.> ext d
@@ -555,7 +644,7 @@ removeNeedlessRenamings =
   filter (\ren -> ren ^. sourceDetails . filename /= ren ^. renamedFile)
 
 dischargeMessages ::
-  (MonadIO m) =>
+  (MonadLog m) =>
   [Either String a] ->
   AppT m [a]
 dischargeMessages = concatMapM $ \case
@@ -577,7 +666,7 @@ dischargeMessages = concatMapM $ \case
 --   4. jww (2024-08-13): If it is the alternate version (different extension)
 --      of an existing photo, it should share the sequence number.
 renameFiles ::
-  (MonadIO m) =>
+  (Monad m) =>
   TimeZone ->
   [FileDetails] ->
   AppT m [RenamedFile]
@@ -594,7 +683,7 @@ hasUniqueExts =
   null . duplicatedElements . map (normalizeExt . (^. fileext))
 
 reportOverlaps ::
-  (MonadIO m, MonadFail m) =>
+  (MonadLog m, MonadFail m) =>
   String ->
   ((Int, Int, a) -> Int) ->
   [(Int, Int, a)] ->
@@ -619,12 +708,12 @@ reportOverlaps label f plan = mapM_ $ \x ->
                 ++ dstPath
 
 buildPlan ::
-  (MonadIO m, MonadFail m) =>
+  (MonadProc m, MonadLog m, MonadFail m) =>
   Maybe FilePath ->
   [RenamedFile] ->
   AppT m [(Int, Int, RenamedFile)]
 buildPlan destDir rs = do
-  pid <- liftIO getCurrentPid
+  pid <- lift $ lift $ getCurrentPid
   rs' <- foldrM go [] rs
   safeguardPlan pid rs'
   where
@@ -669,37 +758,43 @@ buildPlan destDir rs = do
  - Step 7: Execute
  -}
 
-safeRemoveDirectory :: (MonadIO m) => FilePath -> AppT m ()
+safeRemoveDirectory :: (MonadLog m, MonadFS m) => FilePath -> AppT m ()
 safeRemoveDirectory path = do
   putStrLn_ Normal $ "- " ++ path
   dry <- not <$> view execute
-  unless dry $ liftIO $ removeDirectory path
+  unless dry $ lift $ lift $ removeDirectory path
 
-safePruneDirectory :: (MonadIO m) => FilePath -> AppT m ()
+safePruneDirectory :: (MonadLog m, MonadFS m) => FilePath -> AppT m ()
 safePruneDirectory path = do
-  entries <- liftIO $ listDirectory path
+  entries <- lift $ lift $ listDirectory path
   safeToRemove <- flip execStateT True $
     forM_ entries $ \entry -> do
       let entryPath = path </> entry
-      isDir <- liftIO $ doesDirectoryExist entryPath
+      isDir <- lift $ lift $ lift $ doesDirectoryExist entryPath
       if isDir
         then lift $ safePruneDirectory entryPath
         else put False
   when safeToRemove $
     safeRemoveDirectory path
 
-safeRemoveFile :: (MonadIO m) => FilePath -> AppT m ()
+safeRemoveFile :: (MonadLog m, MonadFS m) => FilePath -> AppT m ()
 safeRemoveFile path = do
   putStrLn_ Normal $ "- " ++ path
   dry <- not <$> view execute
-  unless dry $ liftIO $ removeFile path
+  unless dry $ lift $ lift $ removeFile path
 
-safeMoveFile :: String -> FilePath -> Maybe Checksum -> FilePath -> AppT IO ()
+safeMoveFile ::
+  (MonadLog m, MonadFS m, MonadChecksum m) =>
+  String ->
+  FilePath ->
+  Maybe Checksum ->
+  FilePath ->
+  AppT m ()
 safeMoveFile label src srcSum dst
   | strToLower src == strToLower dst = do
       putStrLn_ Verbose $ src ++ " => " ++ dst
       dry <- not <$> view execute
-      unless dry $ liftIO $ renameFile src dst
+      unless dry $ lift $ lift $ renameFile src dst
   | otherwise = do
       shouldMove <- case srcSum of
         Just csum ->
@@ -715,22 +810,22 @@ safeMoveFile label src srcSum dst
             csum <- case srcSum of
               Just csum -> pure csum
               Nothing -> do
-                isFile <- liftIO $ doesFileExist src
+                isFile <- lift $ lift $ doesFileExist src
                 -- This can be False if we are not in --execute mode, and the
                 -- move is from a temp file that was never created.
                 if isFile
-                  then liftIO $ b3sum src
+                  then lift $ lift $ fileChecksum src
                   else pure ""
-            isFile <- liftIO $ doesFileExist dst
+            isFile <- lift $ lift $ doesFileExist dst
             if isFile
               then do
-                csum' <- liftIO $ b3sum dst
+                csum' <- lift $ lift $ fileChecksum dst
                 if csum == csum'
                   then safeRemoveFile src
                   else logErr $ "Destination already exists: " ++ dst
               else do
-                liftIO $ copyFileWithMetadata src dst
-                csum' <- liftIO $ b3sum dst
+                lift $ lift $ copyFileWithMetadata src dst
+                csum' <- lift $ lift $ fileChecksum dst
                 if csum == csum'
                   then safeRemoveFile src
                   else logErr $ "Checksum mismatch: " ++ csum ++ " != " ++ csum'
@@ -738,7 +833,11 @@ safeMoveFile label src srcSum dst
           putStrLn_ Normal $ "INFO: Duplicate: " ++ src
           safeRemoveFile src
 
-executePlan :: TimeZone -> [(Int, Int, RenamedFile)] -> AppT IO ()
+executePlan ::
+  (MonadLog m, MonadFS m, MonadChecksum m, MonadFail m) =>
+  TimeZone ->
+  [(Int, Int, RenamedFile)] ->
+  AppT m ()
 executePlan tz plan = do
   errors <- use errorCount
   if errors > 0
@@ -760,7 +859,7 @@ executePlan tz plan = do
         tm' = utcToLocalTime tz tm
 
     label = \case
-      SimpleRename tm _ -> " (" ++ formattedTime tm ++ ")-> "
-      SimpleRenameAvoidOverlap tm _ -> " (" ++ formattedTime tm ++ ")!> "
-      FollowBase name _ -> " [" ++ name ++ "]-> "
-      FollowTime name _ -> " {" ++ name ++ "}-> "
+      SimpleRename tm -> " (" ++ formattedTime tm ++ ")-> "
+      SimpleRenameAvoidOverlap tm -> " (" ++ formattedTime tm ++ ")!> "
+      FollowBase name -> " [" ++ name ++ "]-> "
+      FollowTime name -> " {" ++ name ++ "}-> "
