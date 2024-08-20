@@ -10,6 +10,7 @@ import Control.Lens
 import Control.Monad.Trans.State
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HM
+import Data.List (sort, sortOn)
 import Data.Maybe (fromJust)
 import Data.Time
 import Data.Time.Format.ISO8601
@@ -87,7 +88,7 @@ instance (Monad m) => MonadFS (StateT Env m) where
   listDirectory path = do
     t <- use envFileTree
     case lookupPath t path of
-      Just (DirEntry xs) -> pure $ HM.keys xs
+      Just (DirEntry xs) -> pure $ sort $ HM.keys xs
       _ -> error $ "Not a directory: " ++ path
   doesFileExist path = do
     t <- use envFileTree
@@ -169,6 +170,13 @@ ls :: (MonadLog m) => StateT Env m ()
 ls = do
   t <- use envFileTree
   printLog $ ppShow t
+
+allPaths :: (Monad m) => StateT Env m [FilePath]
+allPaths = go "" <$> use envFileTree
+  where
+    go name (FileEntry _ _) = [name]
+    go name (DirEntry xs) =
+      concatMap (\(n, x) -> go (name </> n) x) (sortOn fst (HM.toList xs))
 
 runWithFixture :: (Monad m) => StateT Env m a -> m a
 runWithFixture = flip evalStateT (Env 123 (DirEntry mempty))
