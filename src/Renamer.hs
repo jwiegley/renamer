@@ -709,10 +709,10 @@ renameFiles ::
 renameFiles tz destDir ds = do
   rs <- filter (not . idempotentRenaming destDir) <$> simpleRenamings tz ds
   pure $
-    -- removeRedundantTargetRenamings destDir $
-    removeRedundantSourceRenamings destDir $
-      filter (not . idempotentRenaming destDir) $
-        rs ++ siblingRenamings ds rs
+    removeRedundantTargetRenamings destDir $
+      removeRedundantSourceRenamings destDir $
+        filter (not . idempotentRenaming destDir) $
+          rs ++ siblingRenamings ds rs
 
 {-------------------------------------------------------------------------
  - Step 6: Plan
