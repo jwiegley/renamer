@@ -77,7 +77,6 @@ type Extension = String
 
 data FileDetails = FileDetails
   { _captureTime :: Maybe UTCTime,
-    _fileModTime :: UTCTime,
     _filepath :: FilePath, -- "/foo/bar.CR3"
     _filedir :: FilePath, -- "/foo"
     _filename :: FilePath, -- "bar.CR3"
@@ -95,9 +94,6 @@ instance ToJSON FileDetails where
   toEncoding = genericToEncoding defaultOptions
 
 instance FromJSON FileDetails
-
-getTime :: FileDetails -> UTCTime
-getTime d = fromMaybe (d ^. fileModTime) (d ^. captureTime)
 
 type DetailsMap = HashMap FilePath FileDetails
 
@@ -364,7 +360,6 @@ class (Monad m) => MonadFS m where
   listDirectory :: FilePath -> m [FilePath]
   doesFileExist :: FilePath -> m Bool
   doesDirectoryExist :: FilePath -> m Bool
-  getModificationTime :: FilePath -> m UTCTime
   getFileSize :: FilePath -> m Integer
   removeFile :: FilePath -> m ()
   removeDirectory :: FilePath -> m ()
@@ -375,7 +370,6 @@ instance MonadFS IO where
   listDirectory = Dir.listDirectory
   doesFileExist = Dir.doesFileExist
   doesDirectoryExist = Dir.doesDirectoryExist
-  getModificationTime = Dir.getModificationTime
   getFileSize = Dir.getFileSize
   removeFile = Dir.removeFile
   removeDirectory = Dir.removeDirectory
@@ -414,7 +408,6 @@ getFileDetails computeChecksum path = do
       then photoCaptureDate path
       else pure Nothing
   let _fileIdx = -1
-  _fileModTime <- getModificationTime path
   _fileSize <- getFileSize path
   pure FileDetails {..}
 

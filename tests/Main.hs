@@ -27,10 +27,10 @@ testSimpleRename :: TestTree
 testSimpleRename =
   testCase "simple-rename" $
     runWithFixture do
-      photo "test/240806_0082.xmp" "2024-08-16T20:59:10.735765931Z"
+      file "test/240806_0082.xmp"
       photo "test/240806_0082.JPG" "2024-08-16T20:52:16.354628974Z"
       photo "test/240806_0081.CR3" "2024-08-16T19:35:40.702857Z"
-      photo "test/240806_0081.xmp" "2024-08-16T19:35:40.703006Z"
+      file "test/240806_0081.xmp"
       runAppT (defaultOptions) do
         details@[f82xmp, f82jpg, f81cr3, f81xmp] <-
           gatherDetails

@@ -20,7 +20,7 @@ import System.Process (Pid)
 import Text.Show.Pretty
 
 data FileTree
-  = FileEntry (Maybe UTCTime) UTCTime Integer
+  = FileEntry (Maybe UTCTime) Integer
   | DirEntry (HashMap FilePath FileTree)
   deriving (Eq, Show)
 
@@ -51,7 +51,7 @@ instance (Monad m) => MonadPhoto (StateT Env m) where
   photoCaptureDate path = do
     t <- use envFileTree
     pure $ case lookupPath t path of
-      Just (FileEntry tm _ _) -> tm
+      Just (FileEntry tm _) -> tm
       _ -> Nothing
 
 lookupPath :: FileTree -> FilePath -> Maybe FileTree
@@ -70,7 +70,7 @@ adjustPath ::
 adjustPath tree path f = go tree (splitDirectories path)
   where
     go _ [] = error "Empty path"
-    go (FileEntry _ _ _) _ = error "Attempt to descend into file"
+    go (FileEntry _ _) _ = error "Attempt to descend into file"
     go (DirEntry xs) (s : ss) = DirEntry (xs & at s .~ work)
       where
         work = case xs ^? ix s of
@@ -92,27 +92,22 @@ instance (Monad m) => MonadFS (StateT Env m) where
   doesFileExist path = do
     t <- use envFileTree
     pure $ case lookupPath t path of
-      Just (FileEntry _ _ _) -> True
+      Just (FileEntry _ _) -> True
       _ -> False
   doesDirectoryExist path = do
     t <- use envFileTree
     pure $ case lookupPath t path of
       Just (DirEntry _) -> True
       _ -> False
-  getModificationTime path = do
-    t <- use envFileTree
-    case lookupPath t path of
-      Just (FileEntry _ tm _) -> pure tm
-      _ -> error $ "Not a file: " ++ path
   getFileSize path = do
     t <- use envFileTree
     case lookupPath t path of
-      Just (FileEntry _ _ sz) -> pure sz
+      Just (FileEntry _ sz) -> pure sz
       _ -> error $ "Not a file: " ++ path
   removeFile path = do
     t <- use envFileTree
     case lookupPath t path of
-      Just (FileEntry _ _ _) ->
+      Just (FileEntry _ _) ->
         envFileTree .= adjustPath t path (const Nothing)
       _ -> error $ "Not a file: " ++ path
   removeDirectory path = do
@@ -124,7 +119,7 @@ instance (Monad m) => MonadFS (StateT Env m) where
   renameFile path dest = do
     t <- use envFileTree
     case lookupPath t path of
-      Just x@(FileEntry _ _ _) ->
+      Just x@(FileEntry _ _) ->
         envFileTree
           .= adjustPath
             (adjustPath t path (const Nothing))
@@ -134,7 +129,7 @@ instance (Monad m) => MonadFS (StateT Env m) where
   copyFileWithMetadata path dest = do
     t <- use envFileTree
     case lookupPath t path of
-      Just x@(FileEntry _ _ _) ->
+      Just x@(FileEntry _ _) ->
         envFileTree .= adjustPath t dest (const (Just x))
       _ -> error $ "Not a file: " ++ path
 
@@ -151,7 +146,15 @@ photo path tm =
     adjustPath
       t
       path
-      (const (Just (FileEntry (Just (time tm)) (time tm) 100)))
+      (const (Just (FileEntry (Just (time tm)) 100)))
+
+file :: (Monad m) => FilePath -> StateT Env m ()
+file path =
+  envFileTree %= \t ->
+    adjustPath
+      t
+      path
+      (const (Just (FileEntry Nothing 100)))
 
 simpleRename :: FileDetails -> String -> String -> RenamedFile
 simpleRename details name tm = RenamedFile details name (SimpleRename (time tm))
