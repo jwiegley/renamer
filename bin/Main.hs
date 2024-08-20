@@ -155,7 +155,7 @@ buildAndExecutePlan gather dirs mdest =
           ++ show (length details)
           ++ " entries)..."
       tz <- liftIO $ getTimeZone =<< getCurrentTime
-      renamings <- renameFiles tz details
+      renamings <- renameFiles tz mdest details
       d <- view debug
       when d $
         forM_ renamings $ \ren ->

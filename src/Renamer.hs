@@ -2,6 +2,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeOperators #-}
@@ -26,7 +27,6 @@ import Data.IntMap.Strict (IntMap)
 import Data.IntSet qualified as S
 import Data.List (group, nub, partition, sort)
 import Data.Map.Strict qualified as M
-import Data.Maybe (fromMaybe)
 import Data.Time
 import GHC.Generics (Generic)
 import System.Directory qualified as Dir
@@ -108,13 +108,21 @@ makePrisms ''Renaming
 
 data RenamedFile = RenamedFile
   { _sourceDetails :: FileDetails,
-    -- | This is the renamed file, without the directory.
     _renamedFile :: FilePath,
     _renaming :: Renaming
   }
   deriving (Eq, Show)
 
 makeLenses ''RenamedFile
+
+source :: Lens' RenamedFile FilePath
+source = sourceDetails . filepath
+
+target :: Maybe FilePath -> RenamedFile -> FilePath
+target destDir r =
+  case destDir of
+    Just d -> d </> r ^. renamedFile
+    Nothing -> r ^. sourceDetails . filedir </> r ^. renamedFile
 
 -- | State of the image repository (new or old).
 data RenamerState = RenamerState
@@ -631,10 +639,55 @@ simpleRenamings tz = do
                 tm' = utcToLocalTime tz tm
                 newName base seqNum = base ++ "_" ++ printf "%04d" seqNum
 
--- | Remove entries that would rename a file to itself.
-removeNeedlessRenamings :: [RenamedFile] -> [RenamedFile]
-removeNeedlessRenamings =
-  filter (\ren -> ren ^. sourceDetails . filename /= ren ^. renamedFile)
+-- | Entries that would rename a file to itself.
+needlessRenaming :: Maybe FilePath -> RenamedFile -> Bool
+needlessRenaming destDir ren = ren ^. source == target destDir ren
+
+reportNeedlessRenamings ::
+  (MonadLog m) =>
+  Maybe FilePath ->
+  [RenamedFile] ->
+  AppT m ()
+reportNeedlessRenamings destDir rs =
+  forM_ (filter (needlessRenaming destDir) rs) $ \ren ->
+    logErr $
+      "Renaming file to itself: " ++ show ren
+
+overlappedSources ::
+  Maybe FilePath ->
+  [RenamedFile] ->
+  [(FilePath, FilePath)]
+overlappedSources destDir rs = do
+  nm <- duplicatedElements (Prelude.map (^. source) rs)
+  ren <- filter ((== nm) . (^. source)) rs
+  pure (nm, target destDir ren)
+
+reportOverlappedSources ::
+  (MonadLog m) =>
+  Maybe FilePath ->
+  [RenamedFile] ->
+  AppT m ()
+reportOverlappedSources destDir rs =
+  forM_ (overlappedSources destDir rs) $ \(src, dst) ->
+    logErr $ "Overlapped source: " ++ src ++ " -> " ++ dst
+
+overlappedTargets ::
+  Maybe FilePath ->
+  [RenamedFile] ->
+  [(FilePath, FilePath)]
+overlappedTargets destDir rs = do
+  nm <- duplicatedElements (Prelude.map (target destDir) rs)
+  ren <- filter ((== nm) . target destDir) rs
+  pure (ren ^. source, nm)
+
+reportOverlappedTargets ::
+  (MonadLog m) =>
+  Maybe FilePath ->
+  [RenamedFile] ->
+  AppT m ()
+reportOverlappedTargets destDir rs =
+  forM_ (overlappedTargets destDir rs) $ \(src, dst) ->
+    logErr $ "Overlapped target: " ++ src ++ " -> " ++ dst
 
 dischargeMessages ::
   (MonadLog m) =>
@@ -661,11 +714,12 @@ dischargeMessages = concatMapM $ \case
 renameFiles ::
   (Monad m) =>
   TimeZone ->
+  Maybe FilePath ->
   [FileDetails] ->
   AppT m [RenamedFile]
-renameFiles tz ds = do
-  rs <- removeNeedlessRenamings <$> simpleRenamings tz ds
-  pure $ removeNeedlessRenamings $ rs ++ siblingRenamings ds rs
+renameFiles tz destDir ds = do
+  rs <- filter (not . needlessRenaming destDir) <$> simpleRenamings tz ds
+  pure $ filter (not . needlessRenaming destDir) $ rs ++ siblingRenamings ds rs
 
 {-------------------------------------------------------------------------
  - Step 6: Plan
@@ -675,60 +729,29 @@ hasUniqueExts :: [FileDetails] -> Bool
 hasUniqueExts =
   null . duplicatedElements . map (normalizeExt . (^. fileext))
 
-reportOverlaps ::
-  (MonadLog m, MonadFail m) =>
-  String ->
-  ((Int, Int, a) -> Int) ->
-  [(Int, Int, a)] ->
-  [Int] ->
-  AppT m ()
-reportOverlaps label f plan = mapM_ $ \x ->
-  forM_ (filter (\p -> f p == x) plan) $ \(src, dst, _) ->
-    preuse (idxToFilepath . ix src) >>= \case
-      Nothing ->
-        logErr $ "Failed to find path entry for source " ++ show src
-      Just (srcPath, _) ->
-        preuse (idxToFilepath . ix dst) >>= \case
-          Nothing ->
-            logErr $ "Failed to find path entry for dest " ++ show dst
-          Just (dstPath, _) ->
-            logErr $
-              "Overlapped "
-                ++ label
-                ++ ": "
-                ++ srcPath
-                ++ " -> "
-                ++ dstPath
-
 buildPlan ::
   (MonadProc m, MonadLog m, MonadFail m) =>
   Maybe FilePath ->
   [RenamedFile] ->
   AppT m [(Int, Int, RenamedFile)]
 buildPlan destDir rs = do
+  reportNeedlessRenamings destDir rs
+  reportOverlappedSources destDir rs
+  reportOverlappedTargets destDir rs
   pid <- lift $ lift $ getCurrentPid
   rs' <- foldrM go [] rs
   safeguardPlan pid rs'
   where
-    go ren rest
-      | ren ^. sourceDetails . filename == ren ^. renamedFile =
-          error $ "Renaming file to itself: " ++ show ren
-      | otherwise = do
-          idx <-
-            registerPath
-              ( fromMaybe (ren ^. sourceDetails . filedir) destDir
-                  </> ren
-                    ^. renamedFile
-              )
-              (ren ^. sourceDetails . checksum)
-          pure $ (ren ^. sourceDetails . fileIdx, idx, ren) : rest
+    go ren rest = do
+      idx <-
+        registerPath
+          (target destDir ren)
+          (ren ^. sourceDetails . checksum)
+      pure $ (ren ^. sourceDetails . fileIdx, idx, ren) : rest
 
-    safeguardPlan pid plan = do
-      reportOverlaps "src" (\(x, _, _) -> x) plan (duplicatedElements srcs)
-      reportOverlaps "dst" (\(_, x, _) -> x) plan (duplicatedElements dsts)
-      uncurry (++) <$> foldrM work ([], []) plan
+    safeguardPlan pid plan = uncurry (++) <$> foldrM work ([], []) plan
       where
-        (srcs, dsts, _) = unzip3 plan
+        (srcs, _dsts, _) = unzip3 plan
         srcs' = S.fromList srcs
         work (src, dst, ren) (rest, post)
           | dst `S.member` srcs' = do

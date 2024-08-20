@@ -51,8 +51,15 @@ testSameName =
                      "240806_0001.cr3"
                      "2024-08-06T19:35:40.702857Z"
                  ]
-        liftIO $
-          removeNeedlessRenamings renamings @?== []
+        liftIO $ do
+          filter (needlessRenaming Nothing) renamings
+            @?== [ simpleRename
+                     f1cr3
+                     "240806_0001.cr3"
+                     "2024-08-06T19:35:40.702857Z"
+                 ]
+          overlappedSources Nothing renamings @?== []
+          overlappedTargets Nothing renamings @?== []
 
 testSimpleRename :: TestTree
 testSimpleRename =
@@ -63,13 +70,16 @@ testSimpleRename =
       runAppT (defaultOptions) do
         details@[f81cr3] <- gatherDetails True paths
         renamings <- simpleRenamings utc details
-        liftIO $
+        liftIO $ do
           renamings
             @?== [ simpleRename
                      f81cr3
                      "240816_0001.cr3"
                      "2024-08-16T19:35:40.702857Z"
                  ]
+          filter (needlessRenaming Nothing) renamings @?== []
+          overlappedSources Nothing renamings @?== []
+          overlappedTargets Nothing renamings @?== []
 
 testNoRename :: TestTree
 testNoRename =
@@ -92,7 +102,7 @@ testFollowTime =
       runAppT (defaultOptions) do
         details@[f3cr3, f3jpg] <- gatherDetails True paths
         renamings <- simpleRenamings utc details
-        liftIO $
+        liftIO $ do
           renamings
             @?== [ followTime
                      f3cr3
@@ -103,6 +113,9 @@ testFollowTime =
                      "240806_0001.jpg"
                      "2024-08-06T19:35:40.702857Z"
                  ]
+          filter (needlessRenaming Nothing) renamings @?== []
+          overlappedSources Nothing renamings @?== []
+          overlappedTargets Nothing renamings @?== []
 
 testFollowBase :: TestTree
 testFollowBase =
@@ -127,11 +140,15 @@ testFollowBase =
                      "240816_0002.jpg"
                      "2024-08-16T20:52:16.354628974Z"
                  ]
-        liftIO $
-          siblingRenamings details renamings
+        liftIO $ do
+          let siblings = siblingRenamings details renamings
+          siblings
             @?== [ followBase f81xmp "240816_0001.xmp" "test/240806_0081.CR3",
                    followBase f82xmp "240816_0002.xmp" "test/240806_0082.JPG"
                  ]
+          filter (needlessRenaming Nothing) (renamings ++ siblings) @?== []
+          overlappedSources Nothing (renamings ++ siblings) @?== []
+          overlappedTargets Nothing (renamings ++ siblings) @?== []
 
 (@?==) :: (Eq a, Show a, HasCallStack) => a -> a -> Assertion
 actual @?== expected = assertEqual' "" expected actual
