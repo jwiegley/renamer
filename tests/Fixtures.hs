@@ -162,6 +162,10 @@ file path =
 simpleRename :: FileDetails -> String -> String -> RenamedFile
 simpleRename details name tm = RenamedFile details name (SimpleRename (time tm))
 
+simpleRenameAvoidOverlap :: FileDetails -> String -> String -> RenamedFile
+simpleRenameAvoidOverlap details name tm =
+  RenamedFile details name (SimpleRenameAvoidOverlap (time tm))
+
 followBase :: FileDetails -> String -> String -> RenamedFile
 followBase details name n = RenamedFile details name (FollowBase n)
 

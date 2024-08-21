@@ -697,27 +697,32 @@ redundantRenaming :: Maybe FilePath -> RenamedFile -> RenamedFile -> Bool
 redundantRenaming destDir rx ry =
   rx ^. source == ry ^. source && target destDir rx == target destDir ry
 
-removeRedundantSourceRenamings ::
-  Maybe FilePath -> [RenamedFile] -> [RenamedFile]
-removeRedundantSourceRenamings destDir rs =
+removeRedundantRenamings ::
+  (RenamedFile -> FilePath) -> Maybe FilePath -> [RenamedFile] -> [RenamedFile]
+removeRedundantRenamings f destDir rs =
   Prelude.map
     NE.head
-    (NE.groupBy (redundantRenaming destDir) (sortOn (^. source) rs))
+    (NE.groupBy (redundantRenaming destDir) (sortOn f rs))
 
-removeRedundantTargetRenamings ::
-  Maybe FilePath -> [RenamedFile] -> [RenamedFile]
-removeRedundantTargetRenamings destDir rs =
-  Prelude.map
-    NE.head
-    (NE.groupBy (redundantRenaming destDir) (sortOn (target destDir) rs))
-
-overlapped ::
+overlappedRenamings ::
   (RenamedFile -> FilePath) ->
   [RenamedFile] ->
   [(FilePath, [RenamedFile])]
-overlapped f rs = do
+overlappedRenamings f rs = do
   nm <- duplicatedElements (Prelude.map f rs)
   pure (nm, filter ((== nm) . f) rs)
+
+removeOverlappedRenamings :: Maybe FilePath -> [RenamedFile] -> [RenamedFile]
+removeOverlappedRenamings destDir rs =
+  let findOverlaps f xs =
+        concatMap
+          (\(_, rens) -> drop 1 (sortOn (^. renaming) rens))
+          (overlappedRenamings f xs)
+      overlapped = findOverlaps (^. source) rs
+      rs' = filter (`notElem` overlapped) rs
+      overlapped' = findOverlaps (target destDir) rs'
+      rs'' = filter (`notElem` overlapped') rs'
+   in rs''
 
 reportOverlappedSources ::
   (MonadLog m) =>
@@ -725,7 +730,7 @@ reportOverlappedSources ::
   [RenamedFile] ->
   AppT m ()
 reportOverlappedSources destDir rs =
-  forM_ (overlapped (^. source) rs) $ \(src, dsts) ->
+  forM_ (overlappedRenamings (^. source) rs) $ \(src, dsts) ->
     forM_ dsts $ \dst ->
       logErr $ "Overlapped source: " ++ src ++ " -> " ++ target destDir dst
 
@@ -735,7 +740,7 @@ reportOverlappedTargets ::
   [RenamedFile] ->
   AppT m ()
 reportOverlappedTargets destDir rs =
-  forM_ (overlapped (target destDir) rs) $ \(dst, srcs) ->
+  forM_ (overlappedRenamings (target destDir) rs) $ \(dst, srcs) ->
     forM_ srcs $ \src ->
       logErr $ "Overlapped target: " ++ src ^. source ++ " -> " ++ dst
 
@@ -769,10 +774,11 @@ renameFiles tz destDir k1 k2 k3 k4 ds = do
   rs2 <- k2 (siblingRenamings ds rs1')
   rs3 <- k3 (rs1' ++ rs2)
   k4
-    ( removeRedundantTargetRenamings destDir $
-        removeRedundantSourceRenamings destDir $
-          filter (not . idempotentRenaming destDir) $
-            rs3
+    ( removeOverlappedRenamings destDir $
+        removeRedundantRenamings (target destDir) destDir $
+          removeRedundantRenamings (^. source) destDir $
+            filter (not . idempotentRenaming destDir) $
+              rs3
     )
 
 {-------------------------------------------------------------------------

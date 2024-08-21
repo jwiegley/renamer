@@ -32,6 +32,7 @@ main =
         testGroup
           "follow"
           [ testFollowTime,
+            testFollowTimeNoOverlap,
             testFollowBase,
             testRedundantFollow
           ],
@@ -125,6 +126,64 @@ testFollowTime = testCase "time" $ runWithFixture do
       (\_ _ -> pure ())
   paths @?== ["test/240806_0001.cr3", "test/240806_0001.jpg"]
 
+testFollowTimeNoOverlap :: TestTree
+testFollowTimeNoOverlap = testCase "timeNoOverlap" $ runWithFixture do
+  photo "test/120404_0024.JPG" "2012-04-04T16:04:50Z"
+  photo "test/120404_0024.cr2" "2012-04-04T16:04:50Z"
+  photo "test/120404_0134.jpg" "2012-04-04T16:04:50Z"
+  paths <-
+    renamer
+      ["test"]
+      ( \[f24jpg, f24cr2, f134jpg] ->
+          ( @?==
+              [ simpleRenameAvoidOverlap
+                  f24jpg
+                  "120404_0003.jpg"
+                  "2012-04-04T16:04:50Z",
+                simpleRenameAvoidOverlap
+                  f24cr2
+                  "120404_0002.cr2"
+                  "2012-04-04T16:04:50Z",
+                simpleRenameAvoidOverlap
+                  f134jpg
+                  "120404_0001.jpg"
+                  "2012-04-04T16:04:50Z"
+              ]
+          )
+      )
+      (\_ _ -> pure ())
+      ( \[f24jpg, f24cr2, _f134jpg] renamings ->
+          overlappedRenamings (^. source) renamings
+            @?== [ ( "test/120404_0024.JPG",
+                     [ simpleRenameAvoidOverlap
+                         f24jpg
+                         "120404_0003.jpg"
+                         "2012-04-04T16:04:50Z",
+                       followBase
+                         f24jpg
+                         "120404_0002.jpg"
+                         "test/120404_0024.cr2"
+                     ]
+                   ),
+                   ( "test/120404_0024.cr2",
+                     [ simpleRenameAvoidOverlap
+                         f24cr2
+                         "120404_0002.cr2"
+                         "2012-04-04T16:04:50Z",
+                       followBase
+                         f24cr2
+                         "120404_0003.cr2"
+                         "test/120404_0024.JPG"
+                     ]
+                   )
+                 ]
+      )
+  paths
+    @?== [ "test/120404_0001.jpg",
+           "test/120404_0002.cr2",
+           "test/120404_0003.jpg"
+         ]
+
 testFollowBase :: TestTree
 testFollowBase = testCase "base" $ runWithFixture do
   photo "test/240806_0081.CR3" "2024-08-16T19:35:40.702857Z"
@@ -156,8 +215,8 @@ testFollowBase = testCase "base" $ runWithFixture do
       )
       ( \_ renamings -> do
           filter (idempotentRenaming Nothing) renamings @?== []
-          overlapped (^. source) renamings @?== []
-          overlapped (target Nothing) renamings @?== []
+          overlappedRenamings (^. source) renamings @?== []
+          overlappedRenamings (target Nothing) renamings @?== []
       )
   paths
     @?== [ "test/240816_0001.cr3",
@@ -195,7 +254,7 @@ testRedundantFollow = testCase "redundant" $ runWithFixture do
       )
       ( \[f2heic, f2jpg] renamings -> do
           filter (idempotentRenaming Nothing) renamings @?== []
-          overlapped (^. source) renamings
+          overlappedRenamings (^. source) renamings
             @?== [ ( "test/230528_0002.heic",
                      [ followTime
                          f2heic
@@ -219,7 +278,7 @@ testRedundantFollow = testCase "redundant" $ runWithFixture do
                      ]
                    )
                  ]
-          removeRedundantSourceRenamings Nothing renamings
+          removeRedundantRenamings (^. source) Nothing renamings
             @?== [ followTime
                      f2heic
                      "240816_0001.heic"
@@ -229,7 +288,7 @@ testRedundantFollow = testCase "redundant" $ runWithFixture do
                      "240816_0001.jpg"
                      "2024-08-16T19:35:40.702857Z"
                  ]
-          overlapped (target Nothing) renamings
+          overlappedRenamings (target Nothing) renamings
             @?== [ ( "test/240816_0001.heic",
                      [ followTime
                          f2heic
@@ -253,7 +312,7 @@ testRedundantFollow = testCase "redundant" $ runWithFixture do
                      ]
                    )
                  ]
-          removeRedundantTargetRenamings Nothing renamings
+          removeRedundantRenamings (target Nothing) Nothing renamings
             @?== [ followTime
                      f2heic
                      "240816_0001.heic"
