@@ -22,11 +22,13 @@ import Data.Aeson hiding (Error, Options, decodeFileStrict, encodeFile, (.=))
 import Data.Aeson qualified as JSON hiding (Error)
 import Data.Char (toLower)
 import Data.Foldable (foldrM, forM_)
+import Data.Function (on)
 import Data.HashMap.Strict (HashMap)
 import Data.HashSet (HashSet)
 import Data.IntMap.Strict (IntMap)
 import Data.IntSet qualified as S
 import Data.List (group, nub, partition, sort, sortOn)
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
@@ -52,6 +54,9 @@ concatMapM = (fmap concat .) . mapM
 duplicatedElements :: (Ord a) => [a] -> [a]
 duplicatedElements =
   nub . concat . filter ((> 1) . length) . group . sort
+
+sortAndGroupOn :: (Ord b) => (a -> b) -> [a] -> [NonEmpty a]
+sortAndGroupOn f = NE.groupBy ((==) `on` f) . sortOn f
 
 {-------------------------------------------------------------------------
  - Step 1: Schema
@@ -714,16 +719,17 @@ removeRedundantRenamings f destDir rs =
 overlappedRenamings ::
   (RenamedFile -> FilePath) ->
   [RenamedFile] ->
-  [(FilePath, [RenamedFile])]
-overlappedRenamings f rs = do
-  nm <- duplicatedElements (Prelude.map f rs)
-  pure (nm, filter ((== nm) . f) rs)
+  [NonEmpty RenamedFile]
+overlappedRenamings f = filter (\xs -> NE.length xs > 1) . sortAndGroupOn f
 
-removeOverlappedRenamings :: Maybe FilePath -> [RenamedFile] -> [RenamedFile]
+removeOverlappedRenamings ::
+  Maybe FilePath ->
+  [RenamedFile] ->
+  [RenamedFile]
 removeOverlappedRenamings destDir rs =
   let findOverlaps f xs =
         concatMap
-          (\(_, rens) -> drop 1 (sortOn (^. renaming) rens))
+          (\rens -> NE.drop 1 (NE.sortOn (^. renaming) rens))
           (overlappedRenamings f xs)
       overlapped = findOverlaps (^. source) rs
       rs' = filter (`notElem` overlapped) rs
@@ -737,9 +743,13 @@ reportOverlappedSources ::
   [RenamedFile] ->
   AppT m ()
 reportOverlappedSources destDir rs =
-  forM_ (overlappedRenamings (^. source) rs) $ \(src, dsts) ->
+  forM_ (overlappedRenamings (^. source) rs) $ \dsts ->
     forM_ dsts $ \dst ->
-      logErr $ "Overlapped source: " ++ src ++ " -> " ++ target destDir dst
+      logErr $
+        "Overlapped source: "
+          ++ dst ^. source
+          ++ " -> "
+          ++ target destDir dst
 
 reportOverlappedTargets ::
   (MonadLog m) =>
@@ -747,9 +757,13 @@ reportOverlappedTargets ::
   [RenamedFile] ->
   AppT m ()
 reportOverlappedTargets destDir rs =
-  forM_ (overlappedRenamings (target destDir) rs) $ \(dst, srcs) ->
+  forM_ (overlappedRenamings (target destDir) rs) $ \srcs ->
     forM_ srcs $ \src ->
-      logErr $ "Overlapped target: " ++ src ^. source ++ " -> " ++ dst
+      logErr $
+        "Overlapped target: "
+          ++ src ^. source
+          ++ " -> "
+          ++ target destDir src
 
 -- | Determine the ideal name for a given photo, in the context of the
 --   repository where it is meant to abide. Note that this function is called

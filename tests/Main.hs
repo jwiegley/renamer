@@ -7,6 +7,7 @@ module Main where
 import Control.Lens
 import Control.Monad (unless)
 import Control.Monad.IO.Class
+import Data.List.NonEmpty (NonEmpty (..))
 import Fixtures
 import Renamer
 import Test.Tasty
@@ -154,28 +155,24 @@ testFollowTimeNoOverlap = testCase "timeNoOverlap" $ runWithFixture do
       (\_ _ -> pure ())
       ( \[f24jpg, f24cr2, _f134jpg] renamings ->
           overlappedRenamings (^. source) renamings
-            @?== [ ( "test/120404_0024.JPG",
-                     [ simpleRenameAvoidOverlap
-                         f24jpg
-                         "120404_0003.jpg"
-                         "2012-04-04T16:04:50Z",
-                       followBase
-                         f24jpg
-                         "120404_0002.jpg"
-                         "test/120404_0024.cr2"
-                     ]
-                   ),
-                   ( "test/120404_0024.cr2",
-                     [ simpleRenameAvoidOverlap
-                         f24cr2
-                         "120404_0002.cr2"
-                         "2012-04-04T16:04:50Z",
-                       followBase
-                         f24cr2
-                         "120404_0003.cr2"
-                         "test/120404_0024.JPG"
-                     ]
-                   )
+            @?== [ simpleRenameAvoidOverlap
+                     f24jpg
+                     "120404_0003.jpg"
+                     "2012-04-04T16:04:50Z"
+                     :| [ followBase
+                            f24jpg
+                            "120404_0002.jpg"
+                            "test/120404_0024.cr2"
+                        ],
+                   simpleRenameAvoidOverlap
+                     f24cr2
+                     "120404_0002.cr2"
+                     "2012-04-04T16:04:50Z"
+                     :| [ followBase
+                            f24cr2
+                            "120404_0003.cr2"
+                            "test/120404_0024.JPG"
+                        ]
                  ]
       )
   paths
@@ -255,28 +252,24 @@ testRedundantFollow = testCase "redundant" $ runWithFixture do
       ( \[f2heic, f2jpg] renamings -> do
           filter (idempotentRenaming Nothing) renamings @?== []
           overlappedRenamings (^. source) renamings
-            @?== [ ( "test/230528_0002.heic",
-                     [ followTime
-                         f2heic
-                         "240816_0001.heic"
-                         "230528_0002.jpg",
-                       followBase
-                         f2heic
-                         "240816_0001.heic"
-                         "test/230528_0002.jpg"
-                     ]
-                   ),
-                   ( "test/230528_0002.jpg",
-                     [ simpleRename
-                         f2jpg
-                         "240816_0001.jpg"
-                         "2024-08-16T19:35:40.702857Z",
-                       followBase
-                         f2jpg
-                         "240816_0001.jpg"
-                         "test/230528_0002.heic"
-                     ]
-                   )
+            @?== [ followTime
+                     f2heic
+                     "240816_0001.heic"
+                     "230528_0002.jpg"
+                     :| [ followBase
+                            f2heic
+                            "240816_0001.heic"
+                            "test/230528_0002.jpg"
+                        ],
+                   simpleRename
+                     f2jpg
+                     "240816_0001.jpg"
+                     "2024-08-16T19:35:40.702857Z"
+                     :| [ followBase
+                            f2jpg
+                            "240816_0001.jpg"
+                            "test/230528_0002.heic"
+                        ]
                  ]
           removeRedundantRenamings (^. source) Nothing renamings
             @?== [ followTime
@@ -289,28 +282,24 @@ testRedundantFollow = testCase "redundant" $ runWithFixture do
                      "2024-08-16T19:35:40.702857Z"
                  ]
           overlappedRenamings (target Nothing) renamings
-            @?== [ ( "test/240816_0001.heic",
-                     [ followTime
-                         f2heic
-                         "240816_0001.heic"
-                         "230528_0002.jpg",
-                       followBase
-                         f2heic
-                         "240816_0001.heic"
-                         "test/230528_0002.jpg"
-                     ]
-                   ),
-                   ( "test/240816_0001.jpg",
-                     [ simpleRename
-                         f2jpg
-                         "240816_0001.jpg"
-                         "2024-08-16T19:35:40.702857Z",
-                       followBase
-                         f2jpg
-                         "240816_0001.jpg"
-                         "test/230528_0002.heic"
-                     ]
-                   )
+            @?== [ followTime
+                     f2heic
+                     "240816_0001.heic"
+                     "230528_0002.jpg"
+                     :| [ followBase
+                            f2heic
+                            "240816_0001.heic"
+                            "test/230528_0002.jpg"
+                        ],
+                   simpleRename
+                     f2jpg
+                     "240816_0001.jpg"
+                     "2024-08-16T19:35:40.702857Z"
+                     :| [ followBase
+                            f2jpg
+                            "240816_0001.jpg"
+                            "test/230528_0002.heic"
+                        ]
                  ]
           removeRedundantRenamings (target Nothing) Nothing renamings
             @?== [ followTime
