@@ -757,13 +757,13 @@ renameFiles ::
   (Monad m) =>
   TimeZone ->
   Maybe FilePath ->
+  ([RenamedFile] -> AppT m [RenamedFile]) ->
+  ([RenamedFile] -> AppT m [RenamedFile]) ->
+  ([RenamedFile] -> AppT m [RenamedFile]) ->
+  ([RenamedFile] -> AppT m [RenamedFile]) ->
   [FileDetails] ->
-  ([RenamedFile] -> AppT m [RenamedFile]) ->
-  ([RenamedFile] -> AppT m [RenamedFile]) ->
-  ([RenamedFile] -> AppT m [RenamedFile]) ->
-  ([RenamedFile] -> AppT m [RenamedFile]) ->
   AppT m [RenamedFile]
-renameFiles tz destDir ds k1 k2 k3 k4 = do
+renameFiles tz destDir k1 k2 k3 k4 ds = do
   rs1 <- k1 =<< simpleRenamings tz destDir ds
   let rs1' = filter (not . idempotentRenaming destDir) rs1
   rs2 <- k2 (siblingRenamings ds rs1')

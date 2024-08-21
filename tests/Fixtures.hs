@@ -208,11 +208,11 @@ renamer
           renameFiles
             utc
             Nothing
-            details
             (\rs -> rs <$ lift (lift (lift (handleSimpleRenamings details rs))))
             (\rs -> rs <$ lift (lift (lift (handleSiblings details rs))))
             (\rs -> rs <$ lift (lift (lift (handleAllRenamings details rs))))
             pure
+            details
         executePlan utc =<< buildPlan Nothing renamings
     allPaths
 
@@ -235,8 +235,8 @@ importer paths froms destDir = do
     )
     $ do
       _ <- gatherDetails (Just destDir) paths
-      details <- gatherDetails (Just destDir) froms
-      renameFiles utc (Just destDir) details pure pure pure pure
+      gatherDetails (Just destDir) froms
+        >>= renameFiles utc (Just destDir) pure pure pure pure
         >>= buildPlan (Just destDir)
         >>= executePlan utc
   allPaths
