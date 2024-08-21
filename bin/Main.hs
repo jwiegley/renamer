@@ -122,8 +122,14 @@ main = do
               <> help "Number of concurrent IO jobs (default: 1)"
           )
         <*> switch
-          ( long "checksum"
+          ( short 'c'
+              <> long "checksum"
               <> help "Compute file checksums to detect duplicates"
+          )
+        <*> switch
+          ( short 'r'
+              <> long "recursive"
+              <> help "Recurse into directories provided on the command-line"
           )
         <*> switch
           ( long "execute"
@@ -133,13 +139,17 @@ main = do
           ( long "keep-state"
               <> help "Keep state in .file-details.json (to aid debugging)"
           )
+        <*> switch
+          ( long "span"
+              <> help "Number photos within YYmmdd periods across directories"
+          )
 
 buildAndExecutePlan :: Bool -> [FilePath] -> Maybe FilePath -> AppT IO ()
 buildAndExecutePlan gather dirs mdest =
   doGatherDetails >>= doRenameFiles >>= doBuildPlan >>= doExecutePlan
   where
     doGatherDetails = do
-      putStrLn_ Normal "Gathering details..."
+      putStrLn_ Verbose "Gathering details..."
       details <- sort <$> gatherDetails gather dirs
       d <- view debug
       when d $
@@ -150,12 +160,12 @@ buildAndExecutePlan gather dirs mdest =
       pure details
 
     doRenameFiles details = do
-      putStrLn_ Normal $
+      putStrLn_ Verbose $
         "Determining expected file names (from "
           ++ show (length details)
           ++ " entries)..."
       tz <- liftIO $ getTimeZone =<< getCurrentTime
-      renamings <- renameFiles tz mdest details
+      renamings <- renameFiles tz mdest details pure pure pure pure
       d <- view debug
       when d $
         forM_ renamings $ \ren ->
@@ -166,12 +176,11 @@ buildAndExecutePlan gather dirs mdest =
       pure renamings
 
     doBuildPlan renamings = do
-      putStrLn_ Normal $
+      putStrLn_ Verbose $
         "Building renaming plan (from "
           ++ show (length renamings)
           ++ " renamings)..."
       plan <- buildPlan mdest renamings
-      v <- view verbose
       d <- view debug
       when d $
         forM_ plan $ \(src, dst, ren) -> do
@@ -179,7 +188,7 @@ buildAndExecutePlan gather dirs mdest =
           Just (dstPath, _) <- use (idxToFilepath . at dst)
           putStrLn_ Debug $
             srcPath ++ " >>> " ++ dstPath
-          when v $ liftIO $ pPrint ren
+          liftIO $ pPrint ren
       pure plan
 
     doExecutePlan plan = do

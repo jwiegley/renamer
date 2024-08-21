@@ -7,6 +7,8 @@
 module Fixtures where
 
 import Control.Lens
+import Control.Monad (MonadPlus)
+import Control.Monad.Trans.Class
 import Control.Monad.Trans.State
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HM
@@ -180,3 +182,37 @@ allPaths = go "" <$> use envFileTree
 
 runWithFixture :: (Monad m) => StateT Env m a -> m a
 runWithFixture = flip evalStateT (Env 123 (DirEntry mempty))
+
+renamer ::
+  (MonadPlus m, MonadFail m) =>
+  [FilePath] ->
+  ([FileDetails] -> [RenamedFile] -> m ()) ->
+  ([FileDetails] -> [RenamedFile] -> m ()) ->
+  ([FileDetails] -> [RenamedFile] -> m ()) ->
+  StateT Env m [FilePath]
+renamer
+  paths
+  handleSimpleRenamings
+  handleSiblings
+  handleAllRenamings = do
+    runAppT
+      ( defaultOptions
+          { _quiet = True,
+            _recursive = True,
+            _execute = True
+          }
+      )
+      $ do
+        details <- gatherDetails True paths
+        renamings <-
+          renameFiles
+            utc
+            Nothing
+            details
+            (\rs -> rs <$ lift (lift (lift (handleSimpleRenamings details rs))))
+            (\rs -> rs <$ lift (lift (lift (handleSiblings details rs))))
+            (\rs -> rs <$ lift (lift (lift (handleAllRenamings details rs))))
+            pure
+        plan <- buildPlan Nothing renamings
+        executePlan utc plan
+    allPaths

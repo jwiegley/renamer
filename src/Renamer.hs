@@ -13,11 +13,13 @@ import Control.Applicative
 import Control.Concurrent.ParallelIO qualified as PIO
 import Control.Lens hiding ((<.>))
 import Control.Monad (unless, when)
+import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Maybe
 import Control.Monad.Trans.Reader
 import Control.Monad.Trans.State
-import Data.Aeson hiding (Options, decodeFileStrict, encodeFile, (.=))
-import Data.Aeson qualified as JSON
+import Data.Aeson hiding (Error, Options, decodeFileStrict, encodeFile, (.=))
+import Data.Aeson qualified as JSON hiding (Error)
 import Data.Char (toLower)
 import Data.Foldable (foldrM, forM_)
 import Data.HashMap.Strict (HashMap)
@@ -101,9 +103,9 @@ type DetailsMap = HashMap FilePath FileDetails
 data Renaming
   = SimpleRename UTCTime
   | SimpleRenameAvoidOverlap UTCTime
-  | FollowBase FilePath
   | FollowTime FilePath
-  deriving (Eq, Show)
+  | FollowBase FilePath
+  deriving (Eq, Ord, Show)
 
 makePrisms ''Renaming
 
@@ -183,8 +185,10 @@ data Options = Options
     _debug :: !Bool,
     _jobs :: !Int,
     _checksums :: !Bool,
+    _recursive :: !Bool,
     _execute :: !Bool,
-    _keepState :: !Bool
+    _keepState :: !Bool,
+    _spanDirectories :: !Bool
   }
   deriving (Show, Eq)
 
@@ -198,8 +202,10 @@ defaultOptions =
       _debug = False,
       _jobs = 1,
       _checksums = False,
+      _recursive = False,
       _execute = False,
-      _keepState = False
+      _keepState = False,
+      _spanDirectories = False
     }
 
 class (Monad m) => MonadLog m where
@@ -208,13 +214,9 @@ class (Monad m) => MonadLog m where
 instance MonadLog IO where
   printLog = Pre.putStrLn
 
-logErr :: (MonadLog m) => String -> AppT m ()
-logErr msg = do
-  lift $ lift $ printLog $ "ERROR: " ++ msg
-  errorCount += 1
-
 data Verbosity
-  = Normal
+  = Error
+  | Normal
   | Verbose
   | Debug
 
@@ -224,14 +226,20 @@ putStrLn_ verb s = do
   v <- view verbose
   d <- view debug
   when
-    ( not q && case verb of
-        Debug -> d
-        Verbose -> d || v
-        Normal -> True
+    ( case verb of
+        Debug -> not q && d
+        Verbose -> not q && (d || v)
+        Normal -> not q
+        Error -> True
     )
     $ lift
     $ lift
     $ printLog s
+
+logErr :: (MonadLog m) => String -> AppT m ()
+logErr msg = do
+  putStrLn_ Error $ "ERROR: " ++ msg
+  errorCount += 1
 
 type AppT m = ReaderT Options (StateT RenamerState m)
 
@@ -316,8 +324,10 @@ class (Monad m) => MonadPhoto m where
 
 instance MonadPhoto IO where
   photoCaptureDate path =
-    exiftoolImageTimestamp path
-      <|> exiv2ImageTimestamp path
+    runMaybeT $
+      exiftoolSubSecDateTimeOriginal path
+        <|> exiftoolDateTimeOriginal path
+        <|> exiv2ImageTimestamp path
 
 b3sum :: FilePath -> IO String
 b3sum path = do
@@ -331,39 +341,60 @@ b3sum path = do
     ExitFailure code ->
       error $ "b3sum failed, code " ++ show code ++ ": " ++ err
 
-exiv2ImageTimestamp :: FilePath -> IO (Maybe UTCTime)
+exiv2ImageTimestamp :: FilePath -> MaybeT IO UTCTime
 exiv2ImageTimestamp path = do
   (ec, out, _err) <-
-    readProcessWithExitCode
-      "exiv2"
-      ["-g", "Exif.Image.DateTime", "-Pv", path]
-      ""
-  case ec of
-    ExitSuccess ->
-      pure $
-        parseTimeM
-          False
-          defaultTimeLocale
-          "%0Y:%0m:%0d %0H:%0M:%0S\n"
-          out
-    ExitFailure _code -> pure Nothing
+    liftIO $
+      readProcessWithExitCode
+        "exiv2"
+        ["-g", "Exif.Image.DateTime", "-Pv", path]
+        ""
+  MaybeT $
+    pure $
+      case ec of
+        ExitSuccess ->
+          parseTimeM
+            False
+            defaultTimeLocale
+            "%0Y:%0m:%0d %0H:%0M:%0S\n"
+            out
+        ExitFailure _code -> Nothing
 
-exiftoolImageTimestamp :: FilePath -> IO (Maybe UTCTime)
-exiftoolImageTimestamp path = do
+exiftoolSubSecDateTimeOriginal :: FilePath -> MaybeT IO UTCTime
+exiftoolSubSecDateTimeOriginal path = do
   (ec, out, _err) <-
-    readProcessWithExitCode
-      "exiftool"
-      ["-SubSecDateTimeOriginal", path]
-      ""
-  case ec of
+    liftIO $
+      readProcessWithExitCode
+        "exiftool"
+        ["-SubSecDateTimeOriginal", path]
+        ""
+  MaybeT $ pure $ case ec of
     ExitSuccess ->
-      pure $
-        parseTimeM
-          False
-          defaultTimeLocale
-          "Date/Time Original              : %0Y:%0m:%0d %0H:%0M:%0S%Q%Ez\n"
-          out
-    ExitFailure _code -> pure Nothing
+      parseTimeM
+        False
+        defaultTimeLocale
+        "Date/Time Original              : %0Y:%0m:%0d %0H:%0M:%0S%Q%Ez\n"
+        out
+    ExitFailure _code -> Nothing
+
+exiftoolDateTimeOriginal :: FilePath -> MaybeT IO UTCTime
+exiftoolDateTimeOriginal path = do
+  (ec, out, _err) <-
+    liftIO $
+      readProcessWithExitCode
+        "exiftool"
+        ["-DateTimeOriginal", path]
+        ""
+  MaybeT $
+    pure $
+      case ec of
+        ExitSuccess ->
+          parseTimeM
+            False
+            defaultTimeLocale
+            "Date/Time Original              : %0Y:%0m:%0d %0H:%0M:%0S\n"
+            out
+        ExitFailure _code -> Nothing
 
 class (Monad m) => MonadFS m where
   listDirectory :: FilePath -> m [FilePath]
@@ -429,16 +460,19 @@ registerFileDetails gather FileDetails {..} = do
 
 walkFileEntries ::
   (MonadFS m, MonadLog m) =>
+  Bool ->
   (FilePath -> m a) ->
   FilePath ->
   m [m a]
-walkFileEntries f path = do
+walkFileEntries recurse f path = do
   isDir <- doesDirectoryExist path
   if isDir
-    then do
-      printLog $ "Gathering details from " ++ show path
-      concatMapM (walkFileEntries f . (path </>))
-        =<< listDirectory path
+    then
+      if recurse
+        then do
+          concatMapM (walkFileEntries recurse f . (path </>))
+            =<< listDirectory path
+        else map (f . (path </>)) <$> listDirectory path
     else pure [f path]
 
 -- | Takes a list of files and/or directories, and gathers file details for
@@ -462,6 +496,7 @@ gatherDetails gather = concatMapM $ \entry -> do
   --   idxToFilepath
   --   fileChecksums
   c <- view checksums
+  recurse <- view recursive
   isDir <- lift $ lift $ doesDirectoryExist entry
   details <-
     if isDir
@@ -478,18 +513,21 @@ gatherDetails gather = concatMapM $ \entry -> do
             lift $ put st
             pure details
           Nothing -> do
+            putStrLn_ Verbose $ "Gathering details from " ++ show entry
             details <-
               lift $
                 lift $
                   parallelInterleaved
-                    =<< walkFileEntries (getFileDetails c) entry
+                    =<< walkFileEntries recurse (getFileDetails c) entry
             st <- lift get
             lift $ lift $ encodeFile detailsFile (details, st)
             pure details
-      else
+      else do
+        putStrLn_ Verbose $ "Gathering details from " ++ show entry
         lift $
           lift $
-            parallelInterleaved =<< walkFileEntries (getFileDetails c) entry
+            parallelInterleaved
+              =<< walkFileEntries recurse (getFileDetails c) entry
   lift $ lift stopGlobalPool
   mapM (registerFileDetails gather) details
 
@@ -616,7 +654,16 @@ simpleRenamings tz =
                 name d = base <.> ext d
                 ext d = normalizeExt (d ^. fileext)
 
-            expectedBase = newName (yymmdd tm') <$> nextSeqNum (yymmdd tm')
+            expectedBase = do
+              spanDirs <- view spanDirectories
+              newName (yymmdd tm')
+                <$> nextSeqNum
+                  ( ( if spanDirs
+                        then id
+                        else (e ^. filedir </>)
+                    )
+                      (yymmdd tm')
+                  )
               where
                 tm' = utcToLocalTime tz tm
                 newName base seqNum = base ++ "_" ++ printf "%04d" seqNum
@@ -653,10 +700,13 @@ removeRedundantTargetRenamings destDir rs =
     NE.head
     (NE.groupBy (redundantRenaming destDir) (sortOn (target destDir) rs))
 
-overlappedSources :: [RenamedFile] -> [(FilePath, [RenamedFile])]
-overlappedSources rs = do
-  nm <- duplicatedElements (Prelude.map (^. source) rs)
-  pure (nm, filter ((== nm) . (^. source)) rs)
+overlapped ::
+  (RenamedFile -> FilePath) ->
+  [RenamedFile] ->
+  [(FilePath, [RenamedFile])]
+overlapped f rs = do
+  nm <- duplicatedElements (Prelude.map f rs)
+  pure (nm, filter ((== nm) . f) rs)
 
 reportOverlappedSources ::
   (MonadLog m) =>
@@ -664,17 +714,9 @@ reportOverlappedSources ::
   [RenamedFile] ->
   AppT m ()
 reportOverlappedSources destDir rs =
-  forM_ (overlappedSources rs) $ \(src, dsts) ->
+  forM_ (overlapped (^. source) rs) $ \(src, dsts) ->
     forM_ dsts $ \dst ->
       logErr $ "Overlapped source: " ++ src ++ " -> " ++ target destDir dst
-
-overlappedTargets ::
-  Maybe FilePath ->
-  [RenamedFile] ->
-  [(FilePath, [RenamedFile])]
-overlappedTargets destDir rs = do
-  nm <- duplicatedElements (Prelude.map (target destDir) rs)
-  pure (nm, filter ((== nm) . target destDir) rs)
 
 reportOverlappedTargets ::
   (MonadLog m) =>
@@ -682,7 +724,7 @@ reportOverlappedTargets ::
   [RenamedFile] ->
   AppT m ()
 reportOverlappedTargets destDir rs =
-  forM_ (overlappedTargets destDir rs) $ \(dst, srcs) ->
+  forM_ (overlapped (target destDir) rs) $ \(dst, srcs) ->
     forM_ srcs $ \src ->
       logErr $ "Overlapped target: " ++ src ^. source ++ " -> " ++ dst
 
@@ -705,14 +747,22 @@ renameFiles ::
   TimeZone ->
   Maybe FilePath ->
   [FileDetails] ->
+  ([RenamedFile] -> AppT m [RenamedFile]) ->
+  ([RenamedFile] -> AppT m [RenamedFile]) ->
+  ([RenamedFile] -> AppT m [RenamedFile]) ->
+  ([RenamedFile] -> AppT m [RenamedFile]) ->
   AppT m [RenamedFile]
-renameFiles tz destDir ds = do
-  rs <- filter (not . idempotentRenaming destDir) <$> simpleRenamings tz ds
-  pure $
-    removeRedundantTargetRenamings destDir $
-      removeRedundantSourceRenamings destDir $
-        filter (not . idempotentRenaming destDir) $
-          rs ++ siblingRenamings ds rs
+renameFiles tz destDir ds k1 k2 k3 k4 = do
+  rs1 <- k1 =<< simpleRenamings tz ds
+  let rs1' = filter (not . idempotentRenaming destDir) rs1
+  rs2 <- k2 (siblingRenamings ds rs1')
+  rs3 <- k3 (rs1' ++ rs2)
+  k4
+    ( removeRedundantTargetRenamings destDir $
+        removeRedundantSourceRenamings destDir $
+          filter (not . idempotentRenaming destDir) $
+            rs3
+    )
 
 {-------------------------------------------------------------------------
  - Step 6: Plan
@@ -789,7 +839,7 @@ safePruneDirectory path = do
 
 safeRemoveFile :: (MonadLog m, MonadFS m) => FilePath -> AppT m ()
 safeRemoveFile path = do
-  putStrLn_ Normal $ "- " ++ path
+  putStrLn_ Debug $ "- " ++ path
   dry <- not <$> view execute
   unless dry $ lift $ lift $ removeFile path
 
@@ -853,7 +903,7 @@ executePlan tz plan = do
   if errors > 0
     then logErr "Cannot execute renaming plan with errors"
     else do
-      putStrLn_ Normal $
+      putStrLn_ Verbose $
         "Executing renaming plan ("
           ++ show (length plan)
           ++ " operations)..."
