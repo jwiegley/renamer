@@ -711,10 +711,9 @@ redundantRenaming destDir rx ry =
 
 removeRedundantRenamings ::
   (RenamedFile -> FilePath) -> Maybe FilePath -> [RenamedFile] -> [RenamedFile]
-removeRedundantRenamings f destDir rs =
-  Prelude.map
-    NE.head
-    (NE.groupBy (redundantRenaming destDir) (sortOn f rs))
+removeRedundantRenamings f destDir =
+  -- Prelude.map NE.head . sortAndGroupOn f
+  Prelude.map NE.head . NE.groupBy (redundantRenaming destDir) . sortOn f
 
 groupRenamingsBy ::
   (RenamedFile -> FilePath) ->
@@ -842,10 +841,14 @@ renameFiles tz destDir k1 k2 k3 k4 k5 ds = do
   let (rs5, overlaps) = removeOverlappedRenamings destDir rs4
   forM_ overlaps $ \(x, ys) -> do
     putStrLn_ Debug $ "Preferring this renaming:"
-    putStrLn_ Debug $ "    " ++ renamingLabel tz x
+    putStrLn_ Debug $
+      "    "
+        ++ renamingLabel tz x (x ^. source) (target destDir x)
     putStrLn_ Debug $ "  over these:"
     forM_ ys $ \y ->
-      putStrLn_ Debug $ "    " ++ renamingLabel tz y
+      putStrLn_ Debug $
+        "    "
+          ++ renamingLabel tz y (y ^. source) (target destDir y)
   k5 rs5
 
 {-------------------------------------------------------------------------
@@ -929,7 +932,7 @@ safeRemoveFile path = do
 
 safeMoveFile ::
   (MonadLog m, MonadFS m, MonadChecksum m) =>
-  String ->
+  (FilePath -> FilePath -> String) ->
   FilePath ->
   Maybe Checksum ->
   FilePath ->
@@ -948,7 +951,7 @@ safeMoveFile label src srcSum dst
         Nothing -> pure True
       if shouldMove
         then do
-          putStrLn_ Normal label
+          putStrLn_ Normal $ label src dst
           dry <- not <$> view execute
           unless dry $ do
             csum <- case srcSum of
@@ -997,15 +1000,15 @@ executePlan tz plan = do
         safeMoveFile (renamingLabel tz ren) srcPath csum dstPath
       putStrLn_ Normal "Renaming complete!"
 
-renamingLabel :: TimeZone -> RenamedFile -> String
-renamingLabel tz ren =
-  ren ^. sourceDetails . filepath
+renamingLabel :: TimeZone -> RenamedFile -> FilePath -> FilePath -> String
+renamingLabel tz ren srcPath dstPath =
+  srcPath
     ++ case ren ^. renaming of
       SimpleRename tm -> " (" ++ formattedTime tm ++ ")-> "
       SimpleRenameAvoidOverlap tm -> " (" ++ formattedTime tm ++ ")!> "
       FollowBase name -> " [" ++ name ++ "]-> "
       FollowTime name -> " {" ++ name ++ "}-> "
-    ++ ren ^. renamedFile
+    ++ dstPath
   where
     formattedTime tm =
       formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S%Q" tm'

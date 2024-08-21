@@ -133,7 +133,7 @@ testFollowTimeNoOverlap = testCase "timeNoOverlap" $ runWithFixture do
   photo "test/120404_0024.cr2" "2012-04-04T16:04:50Z"
   photo "test/120404_0134.jpg" "2012-04-04T16:04:50Z"
   paths <-
-    renamer
+    renamerNoIdemCheck
       ["test"]
       ( \[f24jpg, f24cr2, f134jpg] ->
           ( @?==
@@ -176,6 +176,35 @@ testFollowTimeNoOverlap = testCase "timeNoOverlap" $ runWithFixture do
                  ]
       )
   paths
+    @?== [ "test/120404_0001.jpg",
+           "test/120404_0003.cr2",
+           "test/120404_0003.jpg"
+         ]
+  paths' <-
+    renamerNoIdemCheck
+      (reverse paths)
+      ( \[f3jpg, f3cr2, f1jpg] ->
+          ( @?==
+              [ simpleRenameAvoidOverlap
+                  f3jpg
+                  "120404_0003.jpg"
+                  "2012-04-04T16:04:50Z",
+                simpleRenameAvoidOverlap
+                  f3cr2
+                  "120404_0002.cr2"
+                  "2012-04-04T16:04:50Z",
+                simpleRenameAvoidOverlap
+                  f1jpg
+                  "120404_0001.jpg"
+                  "2012-04-04T16:04:50Z"
+              ]
+          )
+      )
+      (\_ _ -> pure ())
+      ( \[_f3jpg, _f3cr2, _f1jpg] renamings ->
+          groupRenamingsBy (^. source) renamings @?== []
+      )
+  paths'
     @?== [ "test/120404_0001.jpg",
            "test/120404_0002.cr2",
            "test/120404_0002.jpg"

@@ -8,6 +8,7 @@ module Fixtures where
 
 import Control.Lens
 import Control.Monad (MonadPlus, when)
+import Control.Monad.IO.Class
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.State
 import Data.Foldable (forM_)
@@ -21,6 +22,7 @@ import Debug.Trace
 import Renamer
 import System.FilePath
 import System.Process (Pid)
+import Test.Tasty.HUnit
 import Text.Show.Pretty
 
 data FileTree
@@ -188,24 +190,24 @@ allPaths = go "" <$> use envFileTree
 runWithFixture :: (Monad m) => StateT Env m a -> m a
 runWithFixture = flip evalStateT (Env 123 (DirEntry mempty))
 
-renamer ::
+renamerNoIdemCheck ::
   (MonadPlus m, MonadFail m) =>
   [FilePath] ->
   ([FileDetails] -> [RenamedFile] -> m ()) ->
   ([FileDetails] -> [RenamedFile] -> m ()) ->
   ([FileDetails] -> [RenamedFile] -> m ()) ->
   StateT Env m [FilePath]
-renamer
+renamerNoIdemCheck
   paths
   handleSimpleRenamings
   handleSiblings
   handleAllRenamings = do
     runAppT
       ( defaultOptions
-          { -- _quiet = True,
-            _quiet = False,
+          { _quiet = True,
+            -- _quiet = False,
             -- _verbose = True,
-            _debug = True,
+            -- _debug = True,
             _recursive = True,
             _execute = True
           }
@@ -246,6 +248,29 @@ renamer
             putStrLn_ Debug $ srcPath ++ " >>> " ++ dstPath
         executePlan utc plan
     allPaths
+
+renamer ::
+  (MonadIO m, MonadPlus m, MonadFail m) =>
+  [FilePath] ->
+  ([FileDetails] -> [RenamedFile] -> m ()) ->
+  ([FileDetails] -> [RenamedFile] -> m ()) ->
+  ([FileDetails] -> [RenamedFile] -> m ()) ->
+  StateT Env m [FilePath]
+renamer paths handleSimpleRenamings handleSiblings handleAllRenamings = do
+  paths' <-
+    renamerNoIdemCheck
+      paths
+      handleSimpleRenamings
+      handleSiblings
+      handleAllRenamings
+  paths'' <-
+    renamerNoIdemCheck
+      (reverse paths')
+      (\_ _ -> pure ())
+      (\_ _ -> pure ())
+      (\_ _ -> pure ())
+  liftIO $ paths'' @?= paths'
+  pure paths'
 
 importer ::
   (MonadPlus m, MonadFail m) =>
