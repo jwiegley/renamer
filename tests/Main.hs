@@ -37,7 +37,8 @@ main =
           ],
         testGroup
           "command"
-          [ testImport
+          [ testImport,
+            testImportCollision
           ]
       ]
 
@@ -267,6 +268,18 @@ testRedundantFollow = testCase "redundant" $ runWithFixture do
 
 testImport :: TestTree
 testImport = testCase "import" $ runWithFixture do
+  photo "test/240806_0001.cr3" "2024-08-06T19:35:40.702857Z"
+  photo "test/240806_0001.jpg" "2024-08-06T19:35:40.702857Z"
+  photo "incoming/IMG_001.jpg" "2024-08-07T20:30:40.702857Z"
+  paths <- importer ["test"] ["incoming"] "test"
+  paths
+    @?== [ "test/240806_0001.cr3",
+           "test/240806_0001.jpg",
+           "test/240807_0001.jpg"
+         ]
+
+testImportCollision :: TestTree
+testImportCollision = testCase "collision" $ runWithFixture do
   photo "test/240806_0001.cr3" "2024-08-06T19:35:40.702857Z"
   photo "test/240806_0001.jpg" "2024-08-06T19:35:40.702857Z"
   photo "incoming/IMG_001.jpg" "2024-08-06T20:30:40.702857Z"
