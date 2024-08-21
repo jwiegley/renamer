@@ -203,7 +203,7 @@ renamer
           }
       )
       $ do
-        details <- gatherDetails True paths
+        details <- gatherDetails Nothing paths
         renamings <-
           renameFiles
             utc
@@ -213,6 +213,30 @@ renamer
             (\rs -> rs <$ lift (lift (lift (handleSiblings details rs))))
             (\rs -> rs <$ lift (lift (lift (handleAllRenamings details rs))))
             pure
-        plan <- buildPlan Nothing renamings
-        executePlan utc plan
+        executePlan utc =<< buildPlan Nothing renamings
     allPaths
+
+importer ::
+  (MonadPlus m, MonadFail m) =>
+  [FilePath] ->
+  [FilePath] ->
+  FilePath ->
+  StateT Env m [FilePath]
+importer paths froms destDir = do
+  runAppT
+    ( defaultOptions
+        { _quiet = True,
+          -- _quiet = False,
+          -- _verbose = True,
+          -- _debug = True,
+          _recursive = True,
+          _execute = True
+        }
+    )
+    $ do
+      _ <- gatherDetails (Just destDir) paths
+      details <- gatherDetails (Just destDir) froms
+      renameFiles utc (Just destDir) details pure pure pure pure
+        >>= buildPlan (Just destDir)
+        >>= executePlan utc
+  allPaths

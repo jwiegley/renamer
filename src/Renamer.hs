@@ -280,8 +280,8 @@ registerPath path mcsum = do
 nameRe :: String
 nameRe = "^([0-9][0-9][0-9][0-9][0-9][0-9])_([0-9][0-9][0-9][0-9])$"
 
-registerCounter :: (Monad m) => FilePath -> AppT m ()
-registerCounter path = case path =~ nameRe of
+registerCounter :: (Monad m) => (FilePath -> FilePath) -> FilePath -> AppT m ()
+registerCounter f path = case path =~ nameRe of
   [(_ : ymd : counter : [])] ->
     forM_
       ( parseTimeM
@@ -292,7 +292,11 @@ registerCounter path = case path =~ nameRe of
           Maybe UTCTime
       )
       $ \_ ->
-        dailyCounter . at ymd ?= read counter
+        let ymd' = f ymd
+         in zoom dailyCounter $
+              preuse (ix ymd') >>= \case
+                Just count -> at ymd' ?= max count (read counter + 1)
+                Nothing -> at ymd' ?= read counter + 1
   _ -> pure ()
 
 {-------------------------------------------------------------------------
@@ -451,10 +455,14 @@ getFileDetails computeChecksum path = do
   _fileSize <- getFileSize path
   pure FileDetails {..}
 
-registerFileDetails :: (Monad m) => Bool -> FileDetails -> AppT m FileDetails
-registerFileDetails gather FileDetails {..} = do
-  when gather $
-    registerCounter _filepath
+registerFileDetails ::
+  (Monad m) =>
+  Maybe FilePath ->
+  FileDetails ->
+  AppT m FileDetails
+registerFileDetails mdest FileDetails {..} = do
+  forM_ mdest $ \destDir ->
+    registerCounter (destDir </>) _filebase
   _fileIdx <- registerPath (_filedir </> _filename) _checksum
   pure FileDetails {..}
 
@@ -486,10 +494,10 @@ gatherDetails ::
     MonadPhoto m,
     Alternative m
   ) =>
-  Bool ->
+  Maybe FilePath ->
   [FilePath] ->
   AppT m [FileDetails]
-gatherDetails gather = concatMapM $ \entry -> do
+gatherDetails mdest = concatMapM $ \entry -> do
   -- Get info on all entries; this is stateful and builds up the following
   -- tables:
   --   filepathToIdx
@@ -529,7 +537,7 @@ gatherDetails gather = concatMapM $ \entry -> do
             parallelInterleaved
               =<< walkFileEntries recurse (getFileDetails c) entry
   lift $ lift stopGlobalPool
-  mapM (registerFileDetails gather) details
+  mapM (registerFileDetails mdest) details
 
 {-------------------------------------------------------------------------
  - Step 5: Naming
@@ -614,9 +622,10 @@ siblingRenamings xs = concatMap go
 simpleRenamings ::
   (Monad m) =>
   TimeZone ->
+  Maybe FilePath ->
   [FileDetails] ->
   AppT m [RenamedFile]
-simpleRenamings tz =
+simpleRenamings tz mdest =
   fmap reverse . foldrM go [] . M.toDescList . contemporaries
   where
     contemporaries ::
@@ -658,9 +667,11 @@ simpleRenamings tz =
               spanDirs <- view spanDirectories
               newName (yymmdd tm')
                 <$> nextSeqNum
-                  ( ( if spanDirs
-                        then id
-                        else (e ^. filedir </>)
+                  ( ( case mdest of
+                        Nothing
+                          | spanDirs -> id
+                          | otherwise -> (e ^. filedir </>)
+                        Just destDir -> (destDir </>)
                     )
                       (yymmdd tm')
                   )
@@ -753,7 +764,7 @@ renameFiles ::
   ([RenamedFile] -> AppT m [RenamedFile]) ->
   AppT m [RenamedFile]
 renameFiles tz destDir ds k1 k2 k3 k4 = do
-  rs1 <- k1 =<< simpleRenamings tz ds
+  rs1 <- k1 =<< simpleRenamings tz destDir ds
   let rs1' = filter (not . idempotentRenaming destDir) rs1
   rs2 <- k2 (siblingRenamings ds rs1')
   rs3 <- k3 (rs1' ++ rs2)

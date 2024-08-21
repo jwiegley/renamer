@@ -34,6 +34,10 @@ main =
           [ testFollowTime,
             testFollowBase,
             testRedundantFollow
+          ],
+        testGroup
+          "command"
+          [ testImport
           ]
       ]
 
@@ -260,6 +264,18 @@ testRedundantFollow = testCase "redundant" $ runWithFixture do
       )
   -- Due to the overlapped sources and targets, no renaming was able to occur.
   paths @?== ["test/240816_0001.heic", "test/240816_0001.jpg"]
+
+testImport :: TestTree
+testImport = testCase "import" $ runWithFixture do
+  photo "test/240806_0001.cr3" "2024-08-06T19:35:40.702857Z"
+  photo "test/240806_0001.jpg" "2024-08-06T19:35:40.702857Z"
+  photo "incoming/IMG_001.jpg" "2024-08-06T20:30:40.702857Z"
+  paths <- importer ["test"] ["incoming"] "test"
+  paths
+    @?== [ "test/240806_0001.cr3",
+           "test/240806_0001.jpg",
+           "test/240806_0002.jpg"
+         ]
 
 (@?==) :: (Eq a, Show a, HasCallStack, MonadIO m) => a -> a -> m ()
 actual @?== expected = liftIO $ assertEqual' "" expected actual

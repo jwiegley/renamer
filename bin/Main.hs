@@ -144,13 +144,13 @@ main = do
               <> help "Number photos within YYmmdd periods across directories"
           )
 
-buildAndExecutePlan :: Bool -> [FilePath] -> Maybe FilePath -> AppT IO ()
-buildAndExecutePlan gather dirs mdest =
+buildAndExecutePlan :: [FilePath] -> Maybe FilePath -> AppT IO ()
+buildAndExecutePlan dirs mdest =
   doGatherDetails >>= doRenameFiles >>= doBuildPlan >>= doExecutePlan
   where
     doGatherDetails = do
       putStrLn_ Verbose "Gathering details..."
-      details <- sort <$> gatherDetails gather dirs
+      details <- sort <$> gatherDetails mdest dirs
       d <- view debug
       when d $
         forM_ details $ \det ->
@@ -196,10 +196,10 @@ buildAndExecutePlan gather dirs mdest =
       executePlan tz plan
 
 renamePhotos :: [FilePath] -> AppT IO ()
-renamePhotos = buildAndExecutePlan True ?? Nothing
+renamePhotos = buildAndExecutePlan ?? Nothing
 
 importPhotos :: [FilePath] -> FilePath -> [FilePath] -> AppT IO ()
 importPhotos froms toPath dirs = do
-  _ <- gatherDetails True dirs
-  buildAndExecutePlan False froms (Just toPath)
+  _ <- gatherDetails (Just toPath) dirs
+  buildAndExecutePlan froms (Just toPath)
   mapM_ safePruneDirectory froms
