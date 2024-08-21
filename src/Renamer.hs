@@ -477,10 +477,17 @@ walkFileEntries recurse f path = do
   if isDir
     then
       if recurse
-        then do
+        then
           concatMapM (walkFileEntries recurse f . (path </>))
             =<< listDirectory path
-        else map (f . (path </>)) <$> listDirectory path
+        else do
+          entries <- map (path </>) <$> listDirectory path
+          flip concatMapM entries $ \entry -> do
+            dir <- doesDirectoryExist entry
+            pure $
+              if dir
+                then []
+                else [f entry]
     else pure [f path]
 
 -- | Takes a list of files and/or directories, and gathers file details for
