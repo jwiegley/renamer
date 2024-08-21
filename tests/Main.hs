@@ -154,7 +154,7 @@ testFollowTimeNoOverlap = testCase "timeNoOverlap" $ runWithFixture do
       )
       (\_ _ -> pure ())
       ( \[f24jpg, f24cr2, _f134jpg] renamings ->
-          overlappedRenamings (^. source) renamings
+          groupRenamingsBy (^. source) renamings
             @?== [ simpleRenameAvoidOverlap
                      f24jpg
                      "120404_0003.jpg"
@@ -178,7 +178,7 @@ testFollowTimeNoOverlap = testCase "timeNoOverlap" $ runWithFixture do
   paths
     @?== [ "test/120404_0001.jpg",
            "test/120404_0002.cr2",
-           "test/120404_0003.jpg"
+           "test/120404_0002.jpg"
          ]
 
 testFollowBase :: TestTree
@@ -212,8 +212,8 @@ testFollowBase = testCase "base" $ runWithFixture do
       )
       ( \_ renamings -> do
           filter (idempotentRenaming Nothing) renamings @?== []
-          overlappedRenamings (^. source) renamings @?== []
-          overlappedRenamings (target Nothing) renamings @?== []
+          groupRenamingsBy (^. source) renamings @?== []
+          groupRenamingsBy (target Nothing) renamings @?== []
       )
   paths
     @?== [ "test/240816_0001.cr3",
@@ -251,7 +251,7 @@ testRedundantFollow = testCase "redundant" $ runWithFixture do
       )
       ( \[f2heic, f2jpg] renamings -> do
           filter (idempotentRenaming Nothing) renamings @?== []
-          overlappedRenamings (^. source) renamings
+          groupRenamingsBy (^. source) renamings
             @?== [ followTime
                      f2heic
                      "240816_0001.heic"
@@ -281,7 +281,7 @@ testRedundantFollow = testCase "redundant" $ runWithFixture do
                      "240816_0001.jpg"
                      "2024-08-16T19:35:40.702857Z"
                  ]
-          overlappedRenamings (target Nothing) renamings
+          groupRenamingsBy (target Nothing) renamings
             @?== [ followTime
                      f2heic
                      "240816_0001.heic"

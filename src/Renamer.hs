@@ -105,11 +105,13 @@ instance FromJSON FileDetails
 
 type DetailsMap = HashMap FilePath FileDetails
 
+-- These are listed in order of priority, when multiple conflicting renamings
+-- are found.
 data Renaming
-  = SimpleRename UTCTime
-  | SimpleRenameAvoidOverlap UTCTime
+  = FollowBase FilePath
   | FollowTime FilePath
-  | FollowBase FilePath
+  | SimpleRename UTCTime
+  | SimpleRenameAvoidOverlap UTCTime
   deriving (Eq, Ord, Show)
 
 makePrisms ''Renaming
@@ -669,25 +671,23 @@ simpleRenamings tz mdest =
             work f base e []
               ++ foldr (work (FollowTime (e ^. filename)) base) [] es
           where
-            work ren base details = (RenamedFile details named ren :)
+            work ren base details =
+              (RenamedFile details (name details) ren :)
               where
-                named = name details
                 name d = base <.> ext d
                 ext d = normalizeExt (d ^. fileext)
 
             expectedBase = do
               spanDirs <- view spanDirectories
               newName (yymmdd tm')
-                <$> nextSeqNum
-                  ( ( case mdest of
-                        Nothing
-                          | spanDirs -> id
-                          | otherwise -> (e ^. filedir </>)
-                        Just destDir -> (destDir </>)
-                    )
-                      (yymmdd tm')
-                  )
+                <$> nextSeqNum (seqIndex spanDirs (yymmdd tm'))
               where
+                seqIndex spanDirs = case mdest of
+                  Nothing
+                    | spanDirs -> id
+                    | otherwise -> (e ^. filedir </>)
+                  Just destDir -> (destDir </>)
+
                 tm' = utcToLocalTime tz tm
                 newName base seqNum = base ++ "_" ++ printf "%04d" seqNum
 
@@ -716,26 +716,52 @@ removeRedundantRenamings f destDir rs =
     NE.head
     (NE.groupBy (redundantRenaming destDir) (sortOn f rs))
 
-overlappedRenamings ::
+groupRenamingsBy ::
   (RenamedFile -> FilePath) ->
   [RenamedFile] ->
   [NonEmpty RenamedFile]
-overlappedRenamings f = filter (\xs -> NE.length xs > 1) . sortAndGroupOn f
+groupRenamingsBy f = filter (\xs -> NE.length xs > 1) . sortAndGroupOn f
 
 removeOverlappedRenamings ::
   Maybe FilePath ->
   [RenamedFile] ->
-  [RenamedFile]
+  ([RenamedFile], [(RenamedFile, NonEmpty RenamedFile)])
 removeOverlappedRenamings destDir rs =
-  let findOverlaps f xs =
-        concatMap
-          (\rens -> NE.drop 1 (NE.sortOn (^. renaming) rens))
-          (overlappedRenamings f xs)
-      overlapped = findOverlaps (^. source) rs
-      rs' = filter (`notElem` overlapped) rs
-      overlapped' = findOverlaps (target destDir) rs'
-      rs'' = filter (`notElem` overlapped') rs'
-   in rs''
+  ( Prelude.map fst rs'',
+    onlyOverlaps rs' ++ onlyOverlaps rs''
+  )
+  where
+    rs' = nonOverlapped (^. source) rs
+    rs'' = nonOverlapped (target destDir) (Prelude.map fst rs')
+
+    nonOverlapped f =
+      foldr
+        ( \rens rest ->
+            let k r = case r ^. renaming of
+                  FollowBase _ ->
+                    r ^. sourceDetails . filepath
+                      `notElem` rest ^.. traverse . _1 . renaming . _FollowBase
+                  _ -> True
+             in -- We can't do a trivial sort here, which might select
+                -- FollowsBase for two entries that each follow each other.
+                -- Instead, it must take into account earlier renamings that
+                -- have been chosen. If
+                --   A [B]-> C   A (T)-> D
+                --   B [A]-> E   B (U)-> F
+                -- then we should end up with
+                --   A [B]-> C   B (U)-> F
+                -- where a simple sort would have chosen
+                --   A [B]-> C   B [A]-> E
+                case sortOn (^. renaming) (NE.filter k rens) of
+                  [] -> error "Unexpected in removeOverlappedRenamings"
+                  y : ys -> (y, ys) : rest
+        )
+        []
+        . sortAndGroupOn f
+
+    onlyOverlaps = concatMap $ \(x, xs) -> case xs of
+      [] -> []
+      y : ys -> [(x, y :| ys)]
 
 reportOverlappedSources ::
   (MonadLog m) =>
@@ -743,7 +769,7 @@ reportOverlappedSources ::
   [RenamedFile] ->
   AppT m ()
 reportOverlappedSources destDir rs =
-  forM_ (overlappedRenamings (^. source) rs) $ \dsts ->
+  forM_ (groupRenamingsBy (^. source) rs) $ \dsts ->
     forM_ dsts $ \dst ->
       logErr $
         "Overlapped source: "
@@ -757,7 +783,7 @@ reportOverlappedTargets ::
   [RenamedFile] ->
   AppT m ()
 reportOverlappedTargets destDir rs =
-  forM_ (overlappedRenamings (target destDir) rs) $ \srcs ->
+  forM_ (groupRenamingsBy (target destDir) rs) $ \srcs ->
     forM_ srcs $ \src ->
       logErr $
         "Overlapped target: "
@@ -780,27 +806,47 @@ reportOverlappedTargets destDir rs =
 --   4. If it is the alternate version (different extension) of an existing
 --      photo, it should share the sequence number.
 renameFiles ::
-  (Monad m) =>
+  (MonadLog m) =>
   TimeZone ->
   Maybe FilePath ->
+  -- | Map over the simple renamings
   ([RenamedFile] -> AppT m [RenamedFile]) ->
+  -- | Map over the siblings renamings (following base)
   ([RenamedFile] -> AppT m [RenamedFile]) ->
+  -- | Map over both of the above, with idempotents removed from the simple
+  --   set; this constitutes all possible renamings before redundant and
+  --   overlapping renamings are removed.
   ([RenamedFile] -> AppT m [RenamedFile]) ->
+  -- | Map over the above after idempotent and redundant renamings are
+  --   removed.
+  ([RenamedFile] -> AppT m [RenamedFile]) ->
+  -- | Map over the above after overlapped remainings have been removed. This
+  --   is the final renaming set. The reason to have all of these interception
+  --   functions is so that the test framework can have visibility into the
+  --   nature of the set at each stage, without replicating this logic.
   ([RenamedFile] -> AppT m [RenamedFile]) ->
   [FileDetails] ->
   AppT m [RenamedFile]
-renameFiles tz destDir k1 k2 k3 k4 ds = do
+renameFiles tz destDir k1 k2 k3 k4 k5 ds = do
   rs1 <- k1 =<< simpleRenamings tz destDir ds
   let rs1' = filter (not . idempotentRenaming destDir) rs1
   rs2 <- k2 (siblingRenamings ds rs1')
   rs3 <- k3 (rs1' ++ rs2)
-  k4
-    ( removeOverlappedRenamings destDir $
-        removeRedundantRenamings (target destDir) destDir $
+  rs4 <-
+    k4
+      ( removeRedundantRenamings (target destDir) destDir $
           removeRedundantRenamings (^. source) destDir $
             filter (not . idempotentRenaming destDir) $
               rs3
-    )
+      )
+  let (rs5, overlaps) = removeOverlappedRenamings destDir rs4
+  forM_ overlaps $ \(x, ys) -> do
+    putStrLn_ Debug $ "Preferring this renaming:"
+    putStrLn_ Debug $ "    " ++ renamingLabel tz x
+    putStrLn_ Debug $ "  over these:"
+    forM_ ys $ \y ->
+      putStrLn_ Debug $ "    " ++ renamingLabel tz y
+  k5 rs5
 
 {-------------------------------------------------------------------------
  - Step 6: Plan
@@ -877,7 +923,7 @@ safePruneDirectory path = do
 
 safeRemoveFile :: (MonadLog m, MonadFS m) => FilePath -> AppT m ()
 safeRemoveFile path = do
-  putStrLn_ Debug $ "- " ++ path
+  -- putStrLn_ Debug $ "- " ++ path
   dry <- not <$> view execute
   unless dry $ lift $ lift $ removeFile path
 
@@ -902,7 +948,7 @@ safeMoveFile label src srcSum dst
         Nothing -> pure True
       if shouldMove
         then do
-          putStrLn_ Normal $ src ++ label ++ dst
+          putStrLn_ Normal label
           dry <- not <$> view execute
           unless dry $ do
             csum <- case srcSum of
@@ -948,16 +994,20 @@ executePlan tz plan = do
       forM_ plan $ \(src, dst, ren) -> do
         Just (srcPath, csum) <- use (idxToFilepath . at src)
         Just (dstPath, _) <- use (idxToFilepath . at dst)
-        safeMoveFile (label (ren ^. renaming)) srcPath csum dstPath
+        safeMoveFile (renamingLabel tz ren) srcPath csum dstPath
       putStrLn_ Normal "Renaming complete!"
+
+renamingLabel :: TimeZone -> RenamedFile -> String
+renamingLabel tz ren =
+  ren ^. sourceDetails . filepath
+    ++ case ren ^. renaming of
+      SimpleRename tm -> " (" ++ formattedTime tm ++ ")-> "
+      SimpleRenameAvoidOverlap tm -> " (" ++ formattedTime tm ++ ")!> "
+      FollowBase name -> " [" ++ name ++ "]-> "
+      FollowTime name -> " {" ++ name ++ "}-> "
+    ++ ren ^. renamedFile
   where
     formattedTime tm =
       formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S%Q" tm'
       where
         tm' = utcToLocalTime tz tm
-
-    label = \case
-      SimpleRename tm -> " (" ++ formattedTime tm ++ ")-> "
-      SimpleRenameAvoidOverlap tm -> " (" ++ formattedTime tm ++ ")!> "
-      FollowBase name -> " [" ++ name ++ "]-> "
-      FollowTime name -> " {" ++ name ++ "}-> "

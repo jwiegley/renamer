@@ -15,7 +15,6 @@ import Renamer
 import System.Exit
 import System.FilePath
 import Text.Regex.TDFA.String ()
-import Text.Show.Pretty
 import Prelude hiding (putStrLn)
 
 version :: String
@@ -165,7 +164,7 @@ buildAndExecutePlan dirs mdest =
           ++ show (length details)
           ++ " entries)..."
       tz <- liftIO $ getTimeZone =<< getCurrentTime
-      renamings <- renameFiles tz mdest pure pure pure pure details
+      renamings <- renameFiles tz mdest pure pure pure pure pure details
       d <- view debug
       when d $
         forM_ renamings $ \ren ->
@@ -183,12 +182,10 @@ buildAndExecutePlan dirs mdest =
       plan <- buildPlan mdest renamings
       d <- view debug
       when d $
-        forM_ plan $ \(src, dst, ren) -> do
+        forM_ plan $ \(src, dst, _) -> do
           Just (srcPath, _) <- use (idxToFilepath . at src)
           Just (dstPath, _) <- use (idxToFilepath . at dst)
-          putStrLn_ Debug $
-            srcPath ++ " >>> " ++ dstPath
-          liftIO $ pPrint ren
+          putStrLn_ Debug $ srcPath ++ " >>> " ++ dstPath
       pure plan
 
     doExecutePlan plan = do

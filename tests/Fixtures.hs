@@ -7,9 +7,10 @@
 module Fixtures where
 
 import Control.Lens
-import Control.Monad (MonadPlus)
+import Control.Monad (MonadPlus, when)
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.State
+import Data.Foldable (forM_)
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HM
 import Data.List (sort, sortOn)
@@ -201,13 +202,20 @@ renamer
   handleAllRenamings = do
     runAppT
       ( defaultOptions
-          { _quiet = True,
+          { -- _quiet = True,
+            _quiet = False,
+            -- _verbose = True,
+            _debug = True,
             _recursive = True,
             _execute = True
           }
       )
       $ do
         details <- gatherDetails Nothing paths
+        putStrLn_ Verbose $
+          "Determining expected file names (from "
+            ++ show (length details)
+            ++ " entries)..."
         renamings <-
           renameFiles
             utc
@@ -216,8 +224,27 @@ renamer
             (\rs -> rs <$ lift (lift (lift (handleSiblings details rs))))
             (\rs -> rs <$ lift (lift (lift (handleAllRenamings details rs))))
             pure
+            pure
             details
-        executePlan utc =<< buildPlan Nothing renamings
+        d <- view debug
+        when d $
+          forM_ renamings $ \ren ->
+            putStrLn_ Debug $
+              ren ^. sourceDetails . filepath
+                ++ " >> "
+                ++ show (ren ^. renaming)
+        putStrLn_ Verbose $
+          "Building renaming plan (from "
+            ++ show (length renamings)
+            ++ " renamings)..."
+        plan <- buildPlan Nothing renamings
+        d' <- view debug
+        when d' $
+          forM_ plan $ \(src, dst, _) -> do
+            Just (srcPath, _) <- use (idxToFilepath . at src)
+            Just (dstPath, _) <- use (idxToFilepath . at dst)
+            putStrLn_ Debug $ srcPath ++ " >>> " ++ dstPath
+        executePlan utc plan
     allPaths
 
 importer ::
@@ -240,7 +267,7 @@ importer paths froms destDir = do
     $ do
       _ <- gatherDetails (Just destDir) paths
       gatherDetails (Just destDir) froms
-        >>= renameFiles utc (Just destDir) pure pure pure pure
+        >>= renameFiles utc (Just destDir) pure pure pure pure pure
         >>= buildPlan (Just destDir)
         >>= executePlan utc
   allPaths
