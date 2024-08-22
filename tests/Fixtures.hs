@@ -1,4 +1,6 @@
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE ViewPatterns #-}
@@ -6,12 +8,11 @@
 
 module Fixtures where
 
+import Control.Applicative (Alternative)
 import Control.Lens
-import Control.Monad (MonadPlus, unless, when)
+import Control.Monad (MonadPlus, unless)
 import Control.Monad.IO.Class
-import Control.Monad.Trans.Class
-import Control.Monad.Trans.State
-import Data.Foldable (forM_)
+import Control.Monad.State
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HM
 import Data.List (sort, sortOn)
@@ -19,6 +20,7 @@ import Data.Maybe (fromJust)
 import Data.Time
 import Data.Time.Format.ISO8601
 import Debug.Trace
+import GHC.Generics
 import Renamer
 import System.FilePath
 import System.Process (Pid)
@@ -40,25 +42,43 @@ data Env = Env
 
 makeLenses ''Env
 
-instance (Monad m) => MonadLog (StateT r m) where
+newtype EnvT m a = EnvT {runEnvT :: StateT Env m a}
+  deriving
+    ( Generic,
+      Functor,
+      Applicative,
+      Monad,
+      MonadIO,
+      MonadState Env,
+      Alternative,
+      MonadPlus,
+      MonadTrans,
+      MonadFail
+    )
+
+instance (Monad m) => MonadLog (EnvT m) where
   printLog = traceM
 
-instance (Monad m) => MonadProc (StateT Env m) where
+instance (Monad m) => MonadProc (EnvT m) where
   getCurrentPid = use envPid
 
-instance (Monad m) => MonadParallel (StateT r m) where
+instance (Monad m) => MonadParallel (EnvT m) where
   parallelInterleaved = sequence
   stopGlobalPool = pure ()
 
-instance (Monad m) => MonadChecksum (StateT Env m) where
+instance (Monad m) => MonadChecksum (EnvT m) where
   fileChecksum _ = pure ""
 
-instance (Monad m) => MonadPhoto (StateT Env m) where
+instance (Monad m) => MonadPhoto (EnvT m) where
   photoCaptureDate path = do
     t <- use envFileTree
     pure $ case lookupPath t path of
       Just (FileEntry tm _) -> tm
       _ -> Nothing
+
+instance (Monad m) => MonadJSON (EnvT m) where
+  decodeFileStrict _ = error "decodeFileStrict not used"
+  encodeFile _ _ = error "encodeFile not used"
 
 lookupPath :: FileTree -> FilePath -> Maybe FileTree
 lookupPath tree path =
@@ -89,7 +109,7 @@ adjustPath tree path f = go tree (splitDirectories path)
             | null ss -> f (Just x)
             | otherwise -> Just (go x ss)
 
-instance (Monad m) => MonadFS (StateT Env m) where
+instance (Monad m) => MonadFS (EnvT m) where
   listDirectory path = do
     t <- use envFileTree
     case lookupPath t path of
@@ -139,14 +159,10 @@ instance (Monad m) => MonadFS (StateT Env m) where
         envFileTree .= adjustPath t dest (const (Just x))
       _ -> error $ "Not a file: " ++ path
 
-instance (Monad m) => MonadJSON (StateT r m) where
-  decodeFileStrict _ = pure Nothing
-  encodeFile _ _ = pure ()
-
 time :: String -> UTCTime
 time = fromJust . iso8601ParseM
 
-photo :: (Monad m) => FilePath -> String -> StateT Env m ()
+photo :: (Monad m) => FilePath -> String -> EnvT m ()
 photo path tm =
   envFileTree %= \t ->
     adjustPath
@@ -154,7 +170,7 @@ photo path tm =
       path
       (const (Just (FileEntry (Just (time tm)) 100)))
 
-file :: (Monad m) => FilePath -> StateT Env m ()
+file :: (Monad m) => FilePath -> EnvT m ()
 file path =
   envFileTree %= \t ->
     adjustPath
@@ -175,28 +191,28 @@ followBase details name n = RenamedFile details name (FollowBase n)
 followTime :: FileDetails -> String -> String -> RenamedFile
 followTime details name n = RenamedFile details name (FollowTime n)
 
-ls :: (MonadLog m) => StateT Env m ()
+ls :: (MonadLog m) => EnvT m ()
 ls = do
   t <- use envFileTree
   printLog $ ppShow t
 
-allPaths :: (Monad m) => StateT Env m [FilePath]
+allPaths :: (Monad m) => EnvT m [FilePath]
 allPaths = go "" <$> use envFileTree
   where
     go name (FileEntry _ _) = [name]
     go name (DirEntry xs) =
       concatMap (\(n, x) -> go (name </> n) x) (sortOn fst (HM.toList xs))
 
-runWithFixture :: (Monad m) => StateT Env m a -> m a
-runWithFixture = flip evalStateT (Env 123 (DirEntry mempty))
+runWithFixture :: (Monad m) => EnvT m a -> m a
+runWithFixture = flip (evalStateT . runEnvT) (Env 123 (DirEntry mempty))
 
 renamerNoIdemCheck ::
-  (MonadIO m, MonadPlus m, MonadFail m) =>
+  (MonadLog m, MonadIO m, MonadPlus m, MonadFail m) =>
   [FilePath] ->
   ([FileDetails] -> [RenamedFile] -> m ()) ->
   ([FileDetails] -> [RenamedFile] -> m ()) ->
   ([FileDetails] -> [RenamedFile] -> m ()) ->
-  StateT Env m [FilePath]
+  EnvT m [FilePath]
 renamerNoIdemCheck
   paths
   handleSimpleRenamings
@@ -213,7 +229,8 @@ renamerNoIdemCheck
           }
       )
       $ do
-        details <- gatherDetails Nothing paths
+        details <- processDetails Nothing =<< gatherDetails paths
+
         putStrLn_ Verbose $
           "Determining expected file names (from "
             ++ show (length details)
@@ -228,36 +245,28 @@ renamerNoIdemCheck
             pure
             pure
             details
-        d <- view debug
-        when d $
-          forM_ renamings $ \ren ->
-            putStrLn_ Debug $
-              ren ^. sourceDetails . filepath
-                ++ " >> "
-                ++ show (ren ^. renaming)
+        whenDebug $ renderRenamings renamings
+
         putStrLn_ Verbose $
           "Building renaming plan (from "
             ++ show (length renamings)
             ++ " renamings)..."
         plan <- buildPlan Nothing renamings
-        d' <- view debug
-        when d' $
-          forM_ plan $ \(src, dst, _) -> do
-            Just (srcPath, _) <- use (idxToFilepath . at src)
-            Just (dstPath, _) <- use (idxToFilepath . at dst)
-            putStrLn_ Debug $ srcPath ++ " >>> " ++ dstPath
+        whenDebug $ renderMappings plan
+
         executePlan utc plan
+
         errors <- use errorCount
         lift $ errors @?== 0
     allPaths
 
 renamer ::
-  (MonadIO m, MonadPlus m, MonadFail m) =>
+  (MonadIO m, MonadPlus m, MonadFail m, MonadLog m) =>
   [FilePath] ->
   ([FileDetails] -> [RenamedFile] -> m ()) ->
   ([FileDetails] -> [RenamedFile] -> m ()) ->
   ([FileDetails] -> [RenamedFile] -> m ()) ->
-  StateT Env m [FilePath]
+  EnvT m [FilePath]
 renamer paths handleSimpleRenamings handleSiblings handleAllRenamings = do
   paths' <-
     renamerNoIdemCheck
@@ -279,7 +288,7 @@ importer ::
   [FilePath] ->
   [FilePath] ->
   FilePath ->
-  StateT Env m [FilePath]
+  EnvT m [FilePath]
 importer paths froms destDir = do
   runAppT
     ( defaultOptions
@@ -292,8 +301,11 @@ importer paths froms destDir = do
         }
     )
     $ do
-      _ <- gatherDetails (Just destDir) paths
-      gatherDetails (Just destDir) froms
+      _ <-
+        gatherDetails paths
+          >>= processDetails (Just destDir)
+      gatherDetails froms
+        >>= processDetails (Just destDir)
         >>= renameFiles utc (Just destDir) pure pure pure pure pure
         >>= buildPlan (Just destDir)
         >>= executePlan utc

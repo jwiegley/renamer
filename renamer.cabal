@@ -36,6 +36,7 @@ library
     , directory
     , filepath
     , lens >=4.9
+    , mtl
     , optparse-applicative
     , parallel-io
     , pretty-show
@@ -60,6 +61,7 @@ executable renamer
     , directory
     , filepath
     , lens >=4.9
+    , mtl
     , optparse-applicative
     , parallel-io
     , pretty-show
@@ -90,6 +92,7 @@ test-suite renamer-tests
     , hedgehog
     , here
     , lens >=4.9
+    , mtl
     , optparse-applicative
     , parallel-io
     , pretty-show

@@ -1,11 +1,12 @@
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 
 module Main where
 
 import Control.Lens hiding ((<.>))
-import Control.Monad (when)
 import Control.Monad.IO.Class
-import Data.Foldable (forM_)
+import Control.Monad.Trans.Class
+import Control.Monad.Trans.State
 import Data.List (sort)
 import Data.Time
 import GHC.Conc (setNumCapabilities)
@@ -142,61 +143,67 @@ main = do
           ( long "span"
               <> help "Number photos within YYmmdd periods across directories"
           )
+        <*> optional
+          ( strOption
+              ( long "write-scenario"
+                  <> help "Write calculated scenario to FILE"
+              )
+          )
+        <*> optional
+          ( strOption
+              ( long "read-scenario"
+                  <> help "Read calculated scenario from FILE"
+              )
+          )
 
 buildAndExecutePlan :: [FilePath] -> Maybe FilePath -> AppT IO ()
-buildAndExecutePlan dirs mdest =
-  doGatherDetails >>= doRenameFiles >>= doBuildPlan >>= doExecutePlan
+buildAndExecutePlan dirs mdest = do
+  tz <- liftIO $ getTimeZone =<< getCurrentTime
+  scenario <- flip evalStateT newScenario $ do
+    details <- doGatherDetails
+    renamings <- doRenameFiles tz details
+    _plan <- doBuildPlan renamings
+    get
+  executePlan tz (scenario ^. scenarioMappings)
   where
     doGatherDetails = do
-      putStrLn_ Verbose "Gathering details..."
-      details <- sort <$> gatherDetails mdest dirs
-      d <- view debug
-      when d $
-        forM_ details $ \det ->
-          putStrLn_ Debug $
-            det ^. filepath
-              ++ maybe "" ((" @ " ++) . show) (det ^. captureTime)
+      details <- lift $ do
+        putStrLn_ Normal "Gathering details..."
+        ds <- sort <$> (processDetails mdest =<< gatherDetails dirs)
+        whenDebug $ renderDetails ds
+        pure ds
+      scenarioDetails .= details
       pure details
 
-    doRenameFiles details = do
-      putStrLn_ Verbose $
-        "Determining expected file names (from "
-          ++ show (length details)
-          ++ " entries)..."
-      tz <- liftIO $ getTimeZone =<< getCurrentTime
-      renamings <- renameFiles tz mdest pure pure pure pure pure details
-      d <- view debug
-      when d $
-        forM_ renamings $ \ren ->
-          putStrLn_ Debug $
-            ren ^. sourceDetails . filepath
-              ++ " >> "
-              ++ show (ren ^. renaming)
+    doRenameFiles tz details = do
+      renamings <- lift $ do
+        putStrLn_ Normal $
+          "Determining expected file names (from "
+            ++ show (length details)
+            ++ " entries)..."
+        rs <- renameFiles tz mdest pure pure pure pure pure details
+        whenDebug $ renderRenamings rs
+        pure rs
+      scenarioRenamings .= renamings
       pure renamings
 
     doBuildPlan renamings = do
-      putStrLn_ Verbose $
-        "Building renaming plan (from "
-          ++ show (length renamings)
-          ++ " renamings)..."
-      plan <- buildPlan mdest renamings
-      d <- view debug
-      when d $
-        forM_ plan $ \(src, dst, _) -> do
-          Just (srcPath, _) <- use (idxToFilepath . at src)
-          Just (dstPath, _) <- use (idxToFilepath . at dst)
-          putStrLn_ Debug $ srcPath ++ " >>> " ++ dstPath
+      plan <- lift $ do
+        putStrLn_ Normal $
+          "Building renaming plan (from "
+            ++ show (length renamings)
+            ++ " renamings)..."
+        p <- buildPlan mdest renamings
+        whenDebug $ renderMappings p
+        pure p
+      scenarioMappings .= plan
       pure plan
-
-    doExecutePlan plan = do
-      tz <- liftIO $ getTimeZone =<< getCurrentTime
-      executePlan tz plan
 
 renamePhotos :: [FilePath] -> AppT IO ()
 renamePhotos = buildAndExecutePlan ?? Nothing
 
 importPhotos :: [FilePath] -> FilePath -> [FilePath] -> AppT IO ()
 importPhotos froms toPath dirs = do
-  _ <- gatherDetails (Just toPath) dirs
+  _ <- processDetails (Just toPath) =<< gatherDetails dirs
   buildAndExecutePlan froms (Just toPath)
   mapM_ safePruneDirectory froms
