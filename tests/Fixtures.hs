@@ -7,7 +7,7 @@
 module Fixtures where
 
 import Control.Lens
-import Control.Monad (MonadPlus, when)
+import Control.Monad (MonadPlus, unless, when)
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.State
@@ -191,7 +191,7 @@ runWithFixture :: (Monad m) => StateT Env m a -> m a
 runWithFixture = flip evalStateT (Env 123 (DirEntry mempty))
 
 renamerNoIdemCheck ::
-  (MonadPlus m, MonadFail m) =>
+  (MonadIO m, MonadPlus m, MonadFail m) =>
   [FilePath] ->
   ([FileDetails] -> [RenamedFile] -> m ()) ->
   ([FileDetails] -> [RenamedFile] -> m ()) ->
@@ -247,6 +247,8 @@ renamerNoIdemCheck
             Just (dstPath, _) <- use (idxToFilepath . at dst)
             putStrLn_ Debug $ srcPath ++ " >>> " ++ dstPath
         executePlan utc plan
+        errors <- use errorCount
+        lift $ errors @?== 0
     allPaths
 
 renamer ::
@@ -296,3 +298,17 @@ importer paths froms destDir = do
         >>= buildPlan (Just destDir)
         >>= executePlan utc
   allPaths
+
+(@?==) :: (Eq a, Show a, HasCallStack, MonadIO m) => a -> a -> m ()
+actual @?== expected = liftIO $ assertEqual' "" expected actual
+
+assertEqual' :: (Eq a, Show a, HasCallStack) => String -> a -> a -> Assertion
+assertEqual' preface expected actual =
+  unless (actual == expected) $ assertFailure msg
+  where
+    msg =
+      (if null preface then "" else preface ++ "\n")
+        ++ "expected: "
+        ++ ppShow expected
+        ++ "\n but got: "
+        ++ ppShow actual

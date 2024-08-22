@@ -11,6 +11,7 @@ module Renamer where
 
 import Control.Applicative
 import Control.Concurrent.ParallelIO qualified as PIO
+import Control.Exception (assert)
 import Control.Lens hiding ((<.>))
 import Control.Monad (unless, when)
 import Control.Monad.IO.Class (liftIO)
@@ -108,10 +109,10 @@ type DetailsMap = HashMap FilePath FileDetails
 -- These are listed in order of priority, when multiple conflicting renamings
 -- are found.
 data Renaming
-  = FollowBase FilePath
-  | FollowTime FilePath
+  = SimpleRenameAvoidOverlap UTCTime
   | SimpleRename UTCTime
-  | SimpleRenameAvoidOverlap UTCTime
+  | FollowBase FilePath
+  | FollowTime FilePath
   deriving (Eq, Ord, Show)
 
 makePrisms ''Renaming
@@ -831,25 +832,41 @@ renameFiles tz destDir k1 k2 k3 k4 k5 ds = do
   let rs1' = filter (not . idempotentRenaming destDir) rs1
   rs2 <- k2 (siblingRenamings ds rs1')
   rs3 <- k3 (rs1' ++ rs2)
-  rs4 <-
-    k4
-      ( removeRedundantRenamings (target destDir) destDir $
-          removeRedundantRenamings (^. source) destDir $
-            filter (not . idempotentRenaming destDir) $
-              rs3
-      )
-  let (rs5, overlaps) = removeOverlappedRenamings destDir rs4
-  forM_ overlaps $ \(x, ys) -> do
-    putStrLn_ Debug $ "Preferring this renaming:"
-    putStrLn_ Debug $
-      "    "
-        ++ renamingLabel tz x (x ^. source) (target destDir x)
-    putStrLn_ Debug $ "  over these:"
-    forM_ ys $ \y ->
-      putStrLn_ Debug $
-        "    "
-          ++ renamingLabel tz y (y ^. source) (target destDir y)
-  k5 rs5
+  assert
+    ( Prelude.all
+        ( \g ->
+            length
+              ( NE.filter
+                  ( \x ->
+                      has (renaming . _SimpleRenameAvoidOverlap) x
+                        || has (renaming . _SimpleRename) x
+                  )
+                  g
+              )
+              < 2
+        )
+        (groupRenamingsBy (^. source) rs3)
+    )
+    $ do
+      rs4 <-
+        k4
+          ( removeRedundantRenamings (target destDir) destDir $
+              removeRedundantRenamings (^. source) destDir $
+                filter (not . idempotentRenaming destDir) $
+                  rs3
+          )
+      let (rs5, overlaps) = removeOverlappedRenamings destDir rs4
+      forM_ overlaps $ \(x, ys) -> do
+        putStrLn_ Normal $ "Preferring this renaming:"
+        putStrLn_ Normal $
+          "    "
+            ++ renamingLabel tz x (x ^. source) (target destDir x)
+        putStrLn_ Normal $ "  over these:"
+        forM_ ys $ \y ->
+          putStrLn_ Normal $
+            "    "
+              ++ renamingLabel tz y (y ^. source) (target destDir y)
+      k5 rs5
 
 {-------------------------------------------------------------------------
  - Step 6: Plan
@@ -951,7 +968,7 @@ safeMoveFile label src srcSum dst
         Nothing -> pure True
       if shouldMove
         then do
-          putStrLn_ Normal $ label src dst
+          putStrLn_ Verbose $ label src dst
           dry <- not <$> view execute
           unless dry $ do
             csum <- case srcSum of
@@ -966,10 +983,20 @@ safeMoveFile label src srcSum dst
             isFile <- lift $ lift $ doesFileExist dst
             if isFile
               then do
-                csum' <- lift $ lift $ fileChecksum dst
-                if csum == csum'
-                  then safeRemoveFile src
-                  else logErr $ "Destination already exists: " ++ dst
+                c <- view checksums
+                if c
+                  then do
+                    csum' <- lift $ lift $ fileChecksum dst
+                    if csum == csum'
+                      then safeRemoveFile src
+                      else
+                        logErr $
+                          "Destination already exists, cannot copy: "
+                            ++ label src dst
+                  else
+                    logErr $
+                      "Destination already exists, cannot copy: "
+                        ++ label src dst
               else do
                 lift $ lift $ copyFileWithMetadata src dst
                 csum' <- lift $ lift $ fileChecksum dst
@@ -998,7 +1025,7 @@ executePlan tz plan = do
         Just (srcPath, csum) <- use (idxToFilepath . at src)
         Just (dstPath, _) <- use (idxToFilepath . at dst)
         safeMoveFile (renamingLabel tz ren) srcPath csum dstPath
-      putStrLn_ Normal "Renaming complete!"
+      putStrLn_ Verbose "Renaming complete!"
 
 renamingLabel :: TimeZone -> RenamedFile -> FilePath -> FilePath -> String
 renamingLabel tz ren srcPath dstPath =

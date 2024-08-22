@@ -79,7 +79,7 @@ test-suite renamer-tests
       Paths_renamer
   hs-source-dirs:
       tests
-  ghc-options: -Wall -Wno-missing-home-modules -fprof-auto
+  ghc-options: -Wall -Wno-missing-home-modules -fprof-auto -fno-ignore-asserts
   build-depends:
       HUnit
     , aeson

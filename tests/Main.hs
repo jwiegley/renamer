@@ -5,14 +5,11 @@
 module Main where
 
 import Control.Lens
-import Control.Monad (unless)
-import Control.Monad.IO.Class
 import Data.List.NonEmpty (NonEmpty (..))
 import Fixtures
 import Renamer
 import Test.Tasty
 import Test.Tasty.HUnit
-import Text.Show.Pretty
 
 -- import Test.Tasty.Hedgehog
 -- import Hedgehog hiding (Action)
@@ -28,7 +25,8 @@ main =
           "simple"
           [ testSameName,
             testNoRename,
-            testSimpleRename
+            testSimpleRename,
+            testDateNoDate
           ],
         testGroup
           "follow"
@@ -102,6 +100,26 @@ testNoRename = testCase "none" $ runWithFixture do
       (\_ _ -> pure ())
       (\_ _ -> pure ())
   paths @?== ["test/240806_0081.xmp"]
+
+testDateNoDate :: TestTree
+testDateNoDate = testCase "dateNoDate" $ runWithFixture do
+  file "test/240806_0001.jpg"
+  photo "test/240806_0002.jpg" "2024-08-06T19:35:40.702857Z"
+  paths <-
+    renamer
+      ["test"]
+      ( \[_f1jpg, f2jpg] ->
+          ( @?==
+              [ simpleRename
+                  f2jpg
+                  "240806_0001.jpg"
+                  "2024-08-06T19:35:40.702857Z"
+              ]
+          )
+      )
+      (\_ _ -> pure ())
+      (\_ _ -> pure ())
+  paths @?== ["test/240806_0001.jpg"]
 
 testFollowTime :: TestTree
 testFollowTime = testCase "time" $ runWithFixture do
@@ -177,7 +195,7 @@ testFollowTimeNoOverlap = testCase "timeNoOverlap" $ runWithFixture do
       )
   paths
     @?== [ "test/120404_0001.jpg",
-           "test/120404_0003.cr2",
+           "test/120404_0002.cr2",
            "test/120404_0003.jpg"
          ]
   paths' <-
@@ -207,7 +225,7 @@ testFollowTimeNoOverlap = testCase "timeNoOverlap" $ runWithFixture do
   paths'
     @?== [ "test/120404_0001.jpg",
            "test/120404_0002.cr2",
-           "test/120404_0002.jpg"
+           "test/120404_0003.jpg"
          ]
 
 testFollowBase :: TestTree
@@ -381,17 +399,3 @@ testImportCollisionSame = testCase "collisionSame" $ runWithFixture do
            "test/240806_0002.cr3",
            "test/240806_0002.jpg"
          ]
-
-(@?==) :: (Eq a, Show a, HasCallStack, MonadIO m) => a -> a -> m ()
-actual @?== expected = liftIO $ assertEqual' "" expected actual
-
-assertEqual' :: (Eq a, Show a, HasCallStack) => String -> a -> a -> Assertion
-assertEqual' preface expected actual =
-  unless (actual == expected) $ assertFailure msg
-  where
-    msg =
-      (if null preface then "" else preface ++ "\n")
-        ++ "expected: "
-        ++ ppShow expected
-        ++ "\n but got: "
-        ++ ppShow actual
