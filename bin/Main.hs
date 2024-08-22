@@ -1,12 +1,11 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module Main where
 
 import Control.Lens hiding ((<.>))
 import Control.Monad.IO.Class
-import Control.Monad.Trans.Class
-import Control.Monad.Trans.State
 import Data.List (sort)
 import Data.Time
 import GHC.Conc (setNumCapabilities)
@@ -159,45 +158,36 @@ main = do
 buildAndExecutePlan :: [FilePath] -> Maybe FilePath -> AppT IO ()
 buildAndExecutePlan dirs mdest = do
   tz <- liftIO $ getTimeZone =<< getCurrentTime
-  scenario <- flip evalStateT newScenario $ do
-    details <- doGatherDetails
-    renamings <- doRenameFiles tz details
-    _plan <- doBuildPlan renamings
-    get
+  scenario <- do
+    _scenarioDetails <- doGatherDetails
+    _scenarioRenamings <- doRenameFiles tz _scenarioDetails
+    _scenarioMappings <- doBuildPlan (_scenarioRenamings ^. allRenamings)
+    pure Scenario {..}
   executePlan tz (scenario ^. scenarioMappings)
   where
     doGatherDetails = do
-      details <- lift $ do
-        putStrLn_ Normal "Gathering details..."
-        ds <- sort <$> (processDetails mdest =<< gatherDetails dirs)
-        whenDebug $ renderDetails ds
-        pure ds
-      scenarioDetails .= details
-      pure details
+      putStrLn_ Normal "Gathering details..."
+      ds <- sort <$> (processDetails mdest =<< gatherDetails dirs)
+      whenDebug $ renderDetails ds
+      pure ds
 
     doRenameFiles tz details = do
-      renamings <- lift $ do
-        putStrLn_ Normal $
-          "Determining expected file names (from "
-            ++ show (length details)
-            ++ " entries)..."
-        rs <- renameFiles tz mdest pure pure pure pure pure details
-        whenDebug $ renderRenamings rs
-        pure rs
-      scenarioRenamings .= renamings
-      pure renamings
+      putStrLn_ Normal $
+        "Determining expected file names (from "
+          ++ show (length details)
+          ++ " entries)..."
+      rs <- renameFiles tz mdest details
+      whenDebug $ renderRenamings (rs ^. allRenamings)
+      pure rs
 
     doBuildPlan renamings = do
-      plan <- lift $ do
-        putStrLn_ Normal $
-          "Building renaming plan (from "
-            ++ show (length renamings)
-            ++ " renamings)..."
-        p <- buildPlan mdest renamings
-        whenDebug $ renderMappings p
-        pure p
-      scenarioMappings .= plan
-      pure plan
+      putStrLn_ Normal $
+        "Building renaming plan (from "
+          ++ show (length renamings)
+          ++ " renamings)..."
+      p <- buildPlan mdest renamings
+      whenDebug $ renderMappings p
+      pure p
 
 renamePhotos :: [FilePath] -> AppT IO ()
 renamePhotos = buildAndExecutePlan ?? Nothing

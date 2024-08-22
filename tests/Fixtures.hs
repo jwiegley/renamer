@@ -2,7 +2,9 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 
@@ -209,79 +211,53 @@ runWithFixture = flip (evalStateT . runEnvT) (Env 123 (DirEntry mempty))
 renamerNoIdemCheck ::
   (MonadLog m, MonadIO m, MonadPlus m, MonadFail m) =>
   [FilePath] ->
-  ([FileDetails] -> [RenamedFile] -> m ()) ->
-  ([FileDetails] -> [RenamedFile] -> m ()) ->
-  ([FileDetails] -> [RenamedFile] -> m ()) ->
-  EnvT m [FilePath]
-renamerNoIdemCheck
-  paths
-  handleSimpleRenamings
-  handleSiblings
-  handleAllRenamings = do
-    runAppT
-      ( defaultOptions
-          { _quiet = True,
-            -- _quiet = False,
-            -- _verbose = True,
-            -- _debug = True,
-            _recursive = True,
-            _execute = True
-          }
-      )
-      $ do
-        details <- processDetails Nothing =<< gatherDetails paths
+  EnvT m (Scenario, [FilePath])
+renamerNoIdemCheck paths = do
+  scenario <- runAppT
+    ( defaultOptions
+        { _quiet = True,
+          -- _quiet = False,
+          -- _verbose = True,
+          -- _debug = True,
+          _recursive = True,
+          _execute = True
+        }
+    )
+    $ do
+      _scenarioDetails <- processDetails Nothing =<< gatherDetails paths
 
-        putStrLn_ Verbose $
-          "Determining expected file names (from "
-            ++ show (length details)
-            ++ " entries)..."
-        renamings <-
-          renameFiles
-            utc
-            Nothing
-            (\rs -> rs <$ lift (lift (lift (handleSimpleRenamings details rs))))
-            (\rs -> rs <$ lift (lift (lift (handleSiblings details rs))))
-            (\rs -> rs <$ lift (lift (lift (handleAllRenamings details rs))))
-            pure
-            pure
-            details
-        whenDebug $ renderRenamings renamings
+      putStrLn_ Verbose $
+        "Determining expected file names (from "
+          ++ show (length _scenarioDetails)
+          ++ " entries)..."
+      _scenarioRenamings <- renameFiles utc Nothing _scenarioDetails
+      whenDebug $ renderRenamings (_scenarioRenamings ^. allRenamings)
 
-        putStrLn_ Verbose $
-          "Building renaming plan (from "
-            ++ show (length renamings)
-            ++ " renamings)..."
-        plan <- buildPlan Nothing renamings
-        whenDebug $ renderMappings plan
+      putStrLn_ Verbose $
+        "Building renaming plan (from "
+          ++ show (length (_scenarioRenamings ^. allRenamings))
+          ++ " renamings)..."
+      _scenarioMappings <-
+        buildPlan Nothing (_scenarioRenamings ^. allRenamings)
+      whenDebug $ renderMappings _scenarioMappings
 
-        executePlan utc plan
+      executePlan utc _scenarioMappings
 
-        errors <- use errorCount
-        lift $ errors @?== 0
-    allPaths
+      errors <- use errorCount
+      lift $ errors @?== 0
+
+      pure Scenario {..}
+  (scenario,) <$> allPaths
 
 renamer ::
   (MonadIO m, MonadPlus m, MonadFail m, MonadLog m) =>
   [FilePath] ->
-  ([FileDetails] -> [RenamedFile] -> m ()) ->
-  ([FileDetails] -> [RenamedFile] -> m ()) ->
-  ([FileDetails] -> [RenamedFile] -> m ()) ->
-  EnvT m [FilePath]
-renamer paths handleSimpleRenamings handleSiblings handleAllRenamings = do
-  paths' <-
-    renamerNoIdemCheck
-      paths
-      handleSimpleRenamings
-      handleSiblings
-      handleAllRenamings
-  paths'' <-
-    renamerNoIdemCheck
-      (reverse paths')
-      (\_ _ -> pure ())
-      (\_ _ -> pure ())
-      (\_ _ -> pure ())
+  EnvT m (Scenario, [FilePath])
+renamer paths = do
+  (scenario, paths') <- renamerNoIdemCheck paths
+  (_, paths'') <- renamerNoIdemCheck (reverse paths')
   liftIO $ paths'' @?= paths'
-  pure paths'
+  pure (scenario, paths')
 
 importer ::
   (MonadPlus m, MonadFail m) =>
@@ -306,8 +282,8 @@ importer paths froms destDir = do
           >>= processDetails (Just destDir)
       gatherDetails froms
         >>= processDetails (Just destDir)
-        >>= renameFiles utc (Just destDir) pure pure pure pure pure
-        >>= buildPlan (Just destDir)
+        >>= renameFiles utc (Just destDir)
+        >>= buildPlan (Just destDir) . (^. allRenamings)
         >>= executePlan utc
   allPaths
 

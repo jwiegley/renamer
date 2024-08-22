@@ -1,7 +1,9 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TemplateHaskell #-}
@@ -44,6 +46,18 @@ import Text.Regex.TDFA
 import Text.Regex.TDFA.String ()
 import Prelude hiding (putStrLn)
 import Prelude qualified as Pre (putStrLn)
+
+class Has e a where
+  within :: Lens' e a
+
+instance Has (a, b) b where
+  within = _2
+
+instance Has (a, b) a where
+  within = _1
+
+instance Has a a where
+  within = id
 
 strToLower :: String -> String
 strToLower = Prelude.map toLower
@@ -268,14 +282,15 @@ putStrLn_ verb s = do
 
 logErr ::
   ( MonadReader Options m,
-    MonadState RenamerState m,
+    Has e RenamerState,
+    MonadState e m,
     MonadLog m
   ) =>
   String ->
   m ()
 logErr msg = do
   putStrLn_ Error $ "ERROR: " ++ msg
-  errorCount += 1
+  within . errorCount += 1
 
 {-------------------------------------------------------------------------
  - Step 3: Database manipulation
@@ -295,28 +310,28 @@ setIfMissing k v m = case m ^? ix k of
 
 -- | Register a path name, return its unique integer identifier.
 registerPath ::
-  (MonadState RenamerState m) =>
+  (Has e RenamerState, MonadState e m) =>
   FilePath ->
   Maybe Checksum ->
   m Int
 registerPath path mcsum = do
   forM_ mcsum $ \csum ->
-    fileChecksums %= addToList csum path
+    within . fileChecksums %= addToList csum path
 
-  preuse (filepathToIdx . ix path) >>= \case
+  preuse (within . filepathToIdx . ix path) >>= \case
     Just idx -> pure idx
     Nothing -> do
-      idx <- use fileIdxCounter
-      fileIdxCounter += 1
-      filepathToIdx . at path ?= idx
-      idxToFilepath . at idx ?= (path, mcsum)
+      idx <- use (within . fileIdxCounter)
+      within . fileIdxCounter += 1
+      within . filepathToIdx . at path ?= idx
+      within . idxToFilepath . at idx ?= (path, mcsum)
       pure idx
 
 nameRe :: String
 nameRe = "^([0-9][0-9][0-9][0-9][0-9][0-9])_([0-9][0-9][0-9][0-9])$"
 
 registerCounter ::
-  (MonadState RenamerState m) =>
+  (Has e RenamerState, MonadState e m) =>
   (FilePath -> FilePath) ->
   FilePath ->
   m ()
@@ -332,11 +347,11 @@ registerCounter f path = case path =~ nameRe of
       )
       $ \_ ->
         let ymd' = f ymd
-         in preuse (dailyCounter . ix ymd') >>= \case
+         in preuse (within . dailyCounter . ix ymd') >>= \case
               Just count ->
-                dailyCounter . at ymd' ?= max count (read counter + 1)
+                within . dailyCounter . at ymd' ?= max count (read counter + 1)
               Nothing ->
-                dailyCounter . at ymd' ?= read counter + 1
+                within . dailyCounter . at ymd' ?= read counter + 1
   _ -> pure ()
 
 {-------------------------------------------------------------------------
@@ -563,7 +578,7 @@ getFileDetails computeChecksum path = do
   pure FileDetails {..}
 
 registerFileDetails ::
-  (MonadState RenamerState m) =>
+  (Has e RenamerState, MonadState e m) =>
   Maybe FilePath ->
   FileDetails ->
   m FileDetails
@@ -648,7 +663,7 @@ gatherDetails = concatMapM $ \entry -> do
   pure details
 
 processDetails ::
-  (MonadState RenamerState m) =>
+  (Has e RenamerState, MonadState e m) =>
   Maybe FilePath ->
   [FileDetails] ->
   m [FileDetails]
@@ -661,16 +676,16 @@ processDetails mdest = mapM (registerFileDetails mdest)
 yymmdd :: LocalTime -> String
 yymmdd = formatTime defaultTimeLocale "%y%m%d"
 
-nextSeqNum :: forall m. (MonadState RenamerState m) => String -> m Int
+nextSeqNum :: (Has e RenamerState, MonadState e m) => String -> m Int
 nextSeqNum ymd =
-  preuse (dailyCounter . ix ymd) >>= \case
-    Just idx -> idx <$ (dailyCounter . ix ymd += 1)
-    Nothing -> 1 <$ (dailyCounter . at ymd ?= 2)
+  preuse (within . dailyCounter . ix ymd) >>= \case
+    Just idx -> idx <$ (within . dailyCounter . ix ymd += 1)
+    Nothing -> 1 <$ (within . dailyCounter . at ymd ?= 2)
 
-nextUniqueNum :: (MonadState RenamerState m) => m Int
+nextUniqueNum :: (Has e RenamerState, MonadState e m) => m Int
 nextUniqueNum = do
-  uniqueIdx <- use uniqueCounter
-  uniqueCounter += 1
+  uniqueIdx <- use (within . uniqueCounter)
+  within . uniqueCounter += 1
   pure uniqueIdx
 
 normalizeExt :: String -> String
@@ -748,7 +763,7 @@ siblingRenamings xs = concatMap go
 --   every possible optimization, such as removing needless renamings that
 --   would be idempotent.
 simpleRenamings ::
-  (MonadReader Options m, MonadState RenamerState m) =>
+  (MonadReader Options m, Has e RenamerState, MonadState e m) =>
   TimeZone ->
   Maybe FilePath ->
   [FileDetails] ->
@@ -810,7 +825,7 @@ idempotentRenaming :: Maybe FilePath -> RenamedFile -> Bool
 idempotentRenaming destDir ren = ren ^. source == target destDir ren
 
 reportIdempotentRenamings ::
-  (MonadReader Options m, MonadState RenamerState m, MonadLog m) =>
+  (MonadReader Options m, Has e RenamerState, MonadState e m, MonadLog m) =>
   Maybe FilePath ->
   [RenamedFile] ->
   m ()
@@ -877,7 +892,7 @@ removeOverlappedRenamings destDir rs =
       y : ys -> [(x, y :| ys)]
 
 reportOverlappedSources ::
-  (MonadReader Options m, MonadState RenamerState m, MonadLog m) =>
+  (MonadReader Options m, Has e RenamerState, MonadState e m, MonadLog m) =>
   Maybe FilePath ->
   [RenamedFile] ->
   m ()
@@ -891,7 +906,7 @@ reportOverlappedSources destDir rs =
           ++ target destDir dst
 
 reportOverlappedTargets ::
-  (MonadReader Options m, MonadState RenamerState m, MonadLog m) =>
+  (MonadReader Options m, Has e RenamerState, MonadState e m, MonadLog m) =>
   Maybe FilePath ->
   [RenamedFile] ->
   m ()
@@ -919,6 +934,32 @@ renamingLabel tz ren srcPath dstPath =
       where
         tm' = utcToLocalTime tz tm
 
+data RenamingSet = RenamingSet
+  { _allSimpleRenamings :: [RenamedFile],
+    _allSiblingRenamings :: [RenamedFile],
+    _allRenamingsWithoutRedundancies :: [RenamedFile],
+    -- | All remainings includes both simple and sibling renamings, and is
+    --   clear of idempotent, redundant and overlapped renamings.
+    _allRenamings :: [RenamedFile]
+  }
+  deriving (Show, Generic)
+
+makeLenses ''RenamingSet
+
+instance ToJSON RenamingSet where
+  toEncoding = genericToEncoding JSON.defaultOptions
+
+instance FromJSON RenamingSet
+
+newRenamingSet :: RenamingSet
+newRenamingSet =
+  RenamingSet
+    { _allSimpleRenamings = [],
+      _allSiblingRenamings = [],
+      _allRenamingsWithoutRedundancies = [],
+      _allRenamings = []
+    }
+
 -- | Determine the ideal name for a given photo, in the context of the
 --   repository where it is meant to abide. Note that this function is called
 --   only after all file details have been gathered throughout the various
@@ -934,32 +975,16 @@ renamingLabel tz ren srcPath dstPath =
 --   4. If it is the alternate version (different extension) of an existing
 --      photo, it should share the sequence number.
 renameFiles ::
-  (MonadReader Options m, MonadState RenamerState m, MonadLog m) =>
+  (MonadReader Options m, Has e RenamerState, MonadState e m, MonadLog m) =>
   TimeZone ->
   Maybe FilePath ->
-  -- | Map over the simple renamings
-  ([RenamedFile] -> m [RenamedFile]) ->
-  -- | Map over the siblings renamings (following base)
-  ([RenamedFile] -> m [RenamedFile]) ->
-  -- | Map over both of the above, with idempotents removed from the simple
-  --   set; this constitutes all possible renamings before redundant and
-  --   overlapping renamings are removed.
-  ([RenamedFile] -> m [RenamedFile]) ->
-  -- | Map over the above after idempotent and redundant renamings are
-  --   removed.
-  ([RenamedFile] -> m [RenamedFile]) ->
-  -- | Map over the above after overlapped remainings have been removed. This
-  --   is the final renaming set. The reason to have all of these interception
-  --   functions is so that the test framework can have visibility into the
-  --   nature of the set at each stage, without replicating this logic.
-  ([RenamedFile] -> m [RenamedFile]) ->
   [FileDetails] ->
-  m [RenamedFile]
-renameFiles tz destDir k1 k2 k3 k4 k5 ds = do
-  rs1 <- k1 =<< simpleRenamings tz destDir ds
+  m RenamingSet
+renameFiles tz destDir ds = do
+  rs1 <- simpleRenamings tz destDir ds
   let rs1' = filter (not . idempotentRenaming destDir) rs1
-  rs2 <- k2 (siblingRenamings ds rs1')
-  rs3 <- k3 (rs1' ++ rs2)
+      rs2 = siblingRenamings ds rs1'
+      rs3 = rs1' ++ rs2
   assert
     ( Prelude.all
         ( \g ->
@@ -976,14 +1001,12 @@ renameFiles tz destDir k1 k2 k3 k4 k5 ds = do
         (groupRenamingsBy (^. source) rs3)
     )
     $ do
-      rs4 <-
-        k4
-          ( removeRedundantRenamings (target destDir) destDir $
+      let rs4 =
+            removeRedundantRenamings (target destDir) destDir $
               removeRedundantRenamings (^. source) destDir $
                 filter (not . idempotentRenaming destDir) $
                   rs3
-          )
-      let (rs5, overlaps) = removeOverlappedRenamings destDir rs4
+          (rs5, overlaps) = removeOverlappedRenamings destDir rs4
       forM_ overlaps $ \(x, ys) -> do
         putStrLn_ Normal $ "Preferring this renaming:"
         putStrLn_ Normal $
@@ -994,7 +1017,7 @@ renameFiles tz destDir k1 k2 k3 k4 k5 ds = do
           putStrLn_ Normal $
             "    "
               ++ renamingLabel tz y (y ^. source) (target destDir y)
-      k5 rs5
+      pure $ RenamingSet rs1 rs2 rs4 rs5
 
 {-------------------------------------------------------------------------
  - Step 6: Plan
@@ -1022,19 +1045,20 @@ mappingSets = foldl' go (mempty, mempty)
 
 renderMappings ::
   ( MonadReader Options m,
-    MonadState RenamerState m,
+    Has e RenamerState,
+    MonadState e m,
     MonadLog m,
     MonadFail m
   ) =>
   [Mapping] ->
   m ()
 renderMappings = mapM_ $ \(Mapping src dst _) -> do
-  Just (srcPath, _) <- use (idxToFilepath . at src)
-  Just (dstPath, _) <- use (idxToFilepath . at dst)
+  Just (srcPath, _) <- use (within . idxToFilepath . at src)
+  Just (dstPath, _) <- use (within . idxToFilepath . at dst)
   putStrLn_ Debug $ srcPath ++ " >>> " ++ dstPath
 
 buildBasicPlan ::
-  (MonadState RenamerState m, MonadProc m, MonadLog m, MonadFail m) =>
+  (Has e RenamerState, MonadState e m, MonadProc m, MonadLog m, MonadFail m) =>
   Maybe FilePath ->
   [RenamedFile] ->
   m [Mapping]
@@ -1048,7 +1072,7 @@ buildBasicPlan destDir = foldrM go []
       pure $ Mapping (ren ^. sourceDetails . fileIdx) idx ren : rest
 
 safeguardPlan ::
-  (MonadState RenamerState m, MonadProc m, MonadLog m, MonadFail m) =>
+  (Has e RenamerState, MonadState e m, MonadProc m, MonadLog m, MonadFail m) =>
   [Mapping] ->
   m [Mapping]
 safeguardPlan plan = do
@@ -1059,7 +1083,7 @@ safeguardPlan plan = do
     work pid (Mapping src dst ren) (rest, post)
       | dst `S.member` srcs = do
           uniqueIdx <- nextUniqueNum
-          Just (dstPath, csum) <- use (idxToFilepath . at dst)
+          Just (dstPath, csum) <- use (within . idxToFilepath . at dst)
           idx <-
             registerPath
               ( takeDirectory dstPath
@@ -1075,7 +1099,8 @@ safeguardPlan plan = do
 
 buildPlan ::
   ( MonadReader Options m,
-    MonadState RenamerState m,
+    Has e RenamerState,
+    MonadState e m,
     MonadProc m,
     MonadLog m,
     MonadFail m
@@ -1095,13 +1120,7 @@ buildPlan destDir rs = do
 
 data Scenario = Scenario
   { _scenarioDetails :: [FileDetails],
-    _scenarioSimpleRenamings :: [RenamedFile],
-    _scenarioSiblingRenamings :: [RenamedFile],
-    _scenarioRenamingsWithoutRedundancies :: [RenamedFile],
-    -- | The final 'scenarioRenamings' include both simple and sibling
-    --   renamings, and is clear of idempotent, redundant and overlapped
-    --   renamings.
-    _scenarioRenamings :: [RenamedFile],
+    _scenarioRenamings :: RenamingSet,
     _scenarioMappings :: [Mapping]
   }
   deriving (Show, Generic)
@@ -1117,10 +1136,7 @@ newScenario :: Scenario
 newScenario =
   Scenario
     { _scenarioDetails = [],
-      _scenarioSimpleRenamings = [],
-      _scenarioSiblingRenamings = [],
-      _scenarioRenamingsWithoutRedundancies = [],
-      _scenarioRenamings = [],
+      _scenarioRenamings = newRenamingSet,
       _scenarioMappings = []
     }
 
@@ -1160,7 +1176,8 @@ safeRemoveFile path = do
 
 safeMoveFile ::
   ( MonadReader Options m,
-    MonadState RenamerState m,
+    Has e RenamerState,
+    MonadState e m,
     MonadLog m,
     MonadFS m,
     MonadChecksum m
@@ -1178,7 +1195,7 @@ safeMoveFile label src srcSum dst
   | otherwise = do
       shouldMove <- case srcSum of
         Just csum ->
-          preuse (fileChecksums . ix csum) >>= \case
+          preuse (within . fileChecksums . ix csum) >>= \case
             Just _ -> pure False
             _ -> pure True
         Nothing -> pure True
@@ -1225,7 +1242,8 @@ safeMoveFile label src srcSum dst
 
 executePlan ::
   ( MonadReader Options m,
-    MonadState RenamerState m,
+    Has e RenamerState,
+    MonadState e m,
     MonadLog m,
     MonadFS m,
     MonadChecksum m,
@@ -1235,7 +1253,7 @@ executePlan ::
   [Mapping] ->
   m ()
 executePlan tz plan = do
-  errors <- use errorCount
+  errors <- use (within . errorCount)
   if errors > 0
     then logErr "Cannot execute renaming plan with errors"
     else do
@@ -1244,8 +1262,8 @@ executePlan tz plan = do
           ++ show (length plan)
           ++ " operations)..."
       forM_ plan $ \(Mapping src dst ren) -> do
-        Just (srcPath, csum) <- use (idxToFilepath . at src)
-        Just (dstPath, _) <- use (idxToFilepath . at dst)
+        Just (srcPath, csum) <- use (within . idxToFilepath . at src)
+        Just (dstPath, _) <- use (within . idxToFilepath . at dst)
         safeMoveFile (renamingLabel tz ren) srcPath csum dstPath
       putStrLn_ Normal "Renaming complete!"
 
