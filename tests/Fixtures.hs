@@ -12,7 +12,7 @@ module Fixtures where
 
 import Control.Applicative (Alternative)
 import Control.Lens
-import Control.Monad (MonadPlus, unless)
+import Control.Monad (MonadPlus, unless, when)
 import Control.Monad.IO.Class
 import Control.Monad.State
 import Data.HashMap.Strict (HashMap)
@@ -68,9 +68,6 @@ instance (Monad m) => MonadParallel (EnvT m) where
   parallelInterleaved = sequence
   stopGlobalPool = pure ()
 
-instance (Monad m) => MonadChecksum (EnvT m) where
-  fileChecksum _ = pure ""
-
 instance (Monad m) => MonadPhoto (EnvT m) where
   photoCaptureDate path = do
     t <- use envFileTree
@@ -111,7 +108,7 @@ adjustPath tree path f = go tree (splitDirectories path)
             | null ss -> f (Just x)
             | otherwise -> Just (go x ss)
 
-instance (Monad m) => MonadFS (EnvT m) where
+instance (Monad m) => MonadFSRead (EnvT m) where
   listDirectory path = do
     t <- use envFileTree
     case lookupPath t path of
@@ -132,6 +129,8 @@ instance (Monad m) => MonadFS (EnvT m) where
     case lookupPath t path of
       Just (FileEntry _ sz) -> pure sz
       _ -> error $ "Not a file: " ++ path
+
+instance (Monad m) => MonadFSWrite (EnvT m) where
   removeFile path = do
     t <- use envFileTree
     case lookupPath t path of
@@ -208,12 +207,12 @@ allPaths = go "" <$> use envFileTree
 runWithFixture :: (Monad m) => EnvT m a -> m a
 runWithFixture = flip (evalStateT . runEnvT) (Env 123 (DirEntry mempty))
 
-renamerNoIdemCheck ::
+renamerExecute ::
   (MonadLog m, MonadIO m, MonadPlus m, MonadFail m) =>
-  [FilePath] ->
-  EnvT m (Scenario, [FilePath])
-renamerNoIdemCheck paths = do
-  scenario <- runAppT
+  Scenario ->
+  EnvT m [FilePath]
+renamerExecute scenario = do
+  runAppT
     ( defaultOptions
         { _quiet = True,
           -- _quiet = False,
@@ -224,49 +223,61 @@ renamerNoIdemCheck paths = do
         }
     )
     $ do
-      _scenarioDetails <- processDetails Nothing =<< gatherDetails paths
+      errors <- use (within . errorCount)
+      when (errors > 0) $
+        error "Cannot execute renaming plan with errors"
+      errors' <- executePlan utc (scenario ^. scenarioMappings)
+      lift $ errors' @?== 0
+  allPaths
 
-      putStrLn_ Verbose $
-        "Determining expected file names (from "
-          ++ show (length _scenarioDetails)
-          ++ " entries)..."
-      _scenarioRenamings <- renameFiles utc Nothing _scenarioDetails
-      whenDebug $ renderRenamings (_scenarioRenamings ^. allRenamings)
-
-      putStrLn_ Verbose $
-        "Building renaming plan (from "
-          ++ show (length (_scenarioRenamings ^. allRenamings))
-          ++ " renamings)..."
-      _scenarioMappings <-
-        buildPlan Nothing (_scenarioRenamings ^. allRenamings)
-      whenDebug $ renderMappings _scenarioMappings
-
-      executePlan utc _scenarioMappings
-
-      errors <- use errorCount
-      lift $ errors @?== 0
-
-      pure Scenario {..}
-  (scenario,) <$> allPaths
+renamerNoIdemCheck ::
+  (MonadLog m, MonadIO m, MonadPlus m, MonadFail m) =>
+  [FilePath] ->
+  [FilePath] ->
+  Maybe FilePath ->
+  EnvT m (Scenario, [FilePath])
+renamerNoIdemCheck
+  _scenarioRepositories
+  _scenarioInputs
+  _scenarioDestination = do
+    scenario <-
+      runAppT
+        ( defaultOptions
+            { _quiet = True,
+              -- _quiet = False,
+              -- _verbose = True,
+              -- _debug = True,
+              _recursive = True,
+              _execute = True
+            }
+        )
+        $ determineScenario
+          utc
+          _scenarioRepositories
+          _scenarioInputs
+          _scenarioDestination
+    (scenario,) <$> renamerExecute scenario
 
 renamer ::
   (MonadIO m, MonadPlus m, MonadFail m, MonadLog m) =>
   [FilePath] ->
+  [FilePath] ->
+  Maybe FilePath ->
   EnvT m (Scenario, [FilePath])
-renamer paths = do
-  (scenario, paths') <- renamerNoIdemCheck paths
-  (_, paths'') <- renamerNoIdemCheck (reverse paths')
+renamer repos inputs destDir = do
+  (scenario, paths') <- renamerNoIdemCheck repos inputs destDir
+  (_, paths'') <- renamerNoIdemCheck (reverse paths') [] Nothing
   liftIO $ paths'' @?= paths'
   pure (scenario, paths')
 
 importer ::
-  (MonadPlus m, MonadFail m) =>
+  (MonadIO m, MonadPlus m, MonadFail m) =>
   [FilePath] ->
   [FilePath] ->
   FilePath ->
   EnvT m [FilePath]
 importer paths froms destDir = do
-  runAppT
+  errors' <- runAppT
     ( defaultOptions
         { _quiet = True,
           -- _quiet = False,
@@ -285,6 +296,7 @@ importer paths froms destDir = do
         >>= renameFiles utc (Just destDir)
         >>= buildPlan (Just destDir) . (^. allRenamings)
         >>= executePlan utc
+  errors' @?== 0
   allPaths
 
 (@?==) :: (Eq a, Show a, HasCallStack, MonadIO m) => a -> a -> m ()

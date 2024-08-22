@@ -26,15 +26,15 @@ import Data.Foldable (foldrM, forM_)
 import Data.Function (on)
 import Data.HashMap.Strict (HashMap)
 import Data.HashSet (HashSet)
-import Data.IntMap.Strict (IntMap)
-import Data.IntSet (IntSet)
-import Data.IntSet qualified as S
 import Data.List (group, nub, partition, sort, sortOn)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
+import Data.Set (Set)
+import Data.Set qualified as S
 import Data.Time
+import Data.Traversable (forM)
 import GHC.Generics (Generic)
 import System.Directory qualified as Dir
 import System.Exit
@@ -103,9 +103,7 @@ data FileDetails = FileDetails
     _filedir :: FilePath, -- "/foo"
     _filename :: FilePath, -- "bar.CR3"
     _filebase :: FilePath, -- "bar"
-    _fileIdx :: Int,
     _fileext :: FilePath, -- ".CR3"
-    _checksum :: Maybe Checksum, -- "<hex string>"
     _fileSize :: Integer
   }
   deriving (Eq, Ord, Show, Generic)
@@ -160,21 +158,14 @@ target destDir r =
 
 -- | State of the image repository (new or old).
 data RenamerState = RenamerState
-  { -- | Mapping from full pathnames to unique integer identifiers and back
-    _filepathToIdx :: HashMap FilePath Int,
-    _idxToFilepath :: IntMap (FilePath, Maybe Checksum),
-    _fileIdxCounter :: Int,
-    -- | Mapping from YYmmdd to a sequence counter for that day
-    _dailyCounter :: HashMap String Int,
+  { _dailyCounter :: HashMap String Integer,
     -- | Mapping from file basename to list of entries sharing that basename,
     --   and whatever renaming has been determined for that base
     _entriesAtBase :: HashMap FilePath [FileDetails],
-    -- | Mapping from checksums to a list of entries sharing that checksum
-    _fileChecksums :: HashMap Checksum [FilePath],
     _renamedEntries :: HashSet FilePath,
     -- | A unique counter used to name temporary files
-    _uniqueCounter :: Int,
-    _errorCount :: Int
+    _uniqueCounter :: Integer,
+    _errorCount :: Integer
   }
   deriving (Show, Generic)
 
@@ -188,12 +179,8 @@ instance FromJSON RenamerState
 newRenamerState :: RenamerState
 newRenamerState =
   RenamerState
-    { _filepathToIdx = mempty,
-      _idxToFilepath = mempty,
-      _fileIdxCounter = 0,
-      _dailyCounter = mempty,
+    { _dailyCounter = mempty,
       _entriesAtBase = mempty,
-      _fileChecksums = mempty,
       _renamedEntries = mempty,
       _uniqueCounter = 0,
       _errorCount = 0
@@ -204,8 +191,14 @@ newRenamerState =
  -}
 
 data Command
-  = ImportPhotos [FilePath] FilePath [FilePath]
-  | RenamePhotos [FilePath]
+  = ImportPhotos
+      { importRepositories :: [FilePath],
+        importDestination :: FilePath,
+        importInputs :: [FilePath]
+      }
+  | RenamePhotos
+      { renameRepositories :: [FilePath]
+      }
   deriving (Show, Eq)
 
 makePrisms ''Command
@@ -215,7 +208,6 @@ data Options = Options
     _verbose :: !Bool,
     _debug :: !Bool,
     _jobs :: !Int,
-    _checksums :: !Bool,
     _recursive :: !Bool,
     _execute :: !Bool,
     _keepState :: !Bool,
@@ -234,7 +226,6 @@ defaultOptions =
       _verbose = False,
       _debug = False,
       _jobs = 1,
-      _checksums = False,
       _recursive = False,
       _execute = False,
       _keepState = False,
@@ -292,6 +283,14 @@ logErr msg = do
   putStrLn_ Error $ "ERROR: " ++ msg
   within . errorCount += 1
 
+logErr' ::
+  ( MonadReader Options m,
+    MonadLog m
+  ) =>
+  String ->
+  m ()
+logErr' msg = putStrLn_ Error $ "ERROR: " ++ msg
+
 {-------------------------------------------------------------------------
  - Step 3: Database manipulation
  -}
@@ -307,25 +306,6 @@ setIfMissing :: (IxValue a ~ b, Eq b, At a) => Index a -> b -> a -> a
 setIfMissing k v m = case m ^? ix k of
   Just _ -> m
   Nothing -> m & at k ?~ v
-
--- | Register a path name, return its unique integer identifier.
-registerPath ::
-  (Has e RenamerState, MonadState e m) =>
-  FilePath ->
-  Maybe Checksum ->
-  m Int
-registerPath path mcsum = do
-  forM_ mcsum $ \csum ->
-    within . fileChecksums %= addToList csum path
-
-  preuse (within . filepathToIdx . ix path) >>= \case
-    Just idx -> pure idx
-    Nothing -> do
-      idx <- use (within . fileIdxCounter)
-      within . fileIdxCounter += 1
-      within . filepathToIdx . at path ?= idx
-      within . idxToFilepath . at idx ?= (path, mcsum)
-      pure idx
 
 nameRe :: String
 nameRe = "^([0-9][0-9][0-9][0-9][0-9][0-9])_([0-9][0-9][0-9][0-9])$"
@@ -390,18 +370,6 @@ instance (MonadParallel m) => MonadParallel (StateT s m) where
     lift $ parallelInterleaved (Prelude.map (flip evalStateT s) xs)
   stopGlobalPool = lift stopGlobalPool
 
-class (Monad m) => MonadChecksum m where
-  fileChecksum :: FilePath -> m String
-
-instance MonadChecksum IO where
-  fileChecksum = b3sum
-
-instance (MonadChecksum m) => MonadChecksum (ReaderT e m) where
-  fileChecksum = lift . fileChecksum
-
-instance (MonadChecksum m) => MonadChecksum (StateT s m) where
-  fileChecksum = lift . fileChecksum
-
 class (Monad m) => MonadPhoto m where
   photoCaptureDate :: FilePath -> m (Maybe UTCTime)
 
@@ -417,18 +385,6 @@ instance (MonadPhoto m) => MonadPhoto (ReaderT e m) where
 
 instance (MonadPhoto m) => MonadPhoto (StateT s m) where
   photoCaptureDate = lift . photoCaptureDate
-
-b3sum :: FilePath -> IO String
-b3sum path = do
-  (ec, out, err) <-
-    readProcessWithExitCode
-      "b3sum"
-      ["--no-names", "--quiet", path]
-      ""
-  case ec of
-    ExitSuccess -> pure $ init out
-    ExitFailure code ->
-      error $ "b3sum failed, code " ++ show code ++ ": " ++ err
 
 exiv2ImageTimestamp :: FilePath -> MaybeT IO UTCTime
 exiv2ImageTimestamp path = do
@@ -485,41 +441,49 @@ exiftoolDateTimeOriginal path = do
             out
         ExitFailure _code -> Nothing
 
-class (Monad m) => MonadFS m where
+class (Monad m) => MonadFSRead m where
   listDirectory :: FilePath -> m [FilePath]
   doesFileExist :: FilePath -> m Bool
   doesDirectoryExist :: FilePath -> m Bool
   getFileSize :: FilePath -> m Integer
+
+class (Monad m) => MonadFSWrite m where
   removeFile :: FilePath -> m ()
   removeDirectory :: FilePath -> m ()
   renameFile :: FilePath -> FilePath -> m ()
   copyFileWithMetadata :: FilePath -> FilePath -> m ()
 
-instance MonadFS IO where
+instance MonadFSRead IO where
   listDirectory = Dir.listDirectory
   doesFileExist = Dir.doesFileExist
   doesDirectoryExist = Dir.doesDirectoryExist
   getFileSize = Dir.getFileSize
+
+instance (MonadFSRead m) => MonadFSRead (ReaderT e m) where
+  listDirectory = lift . listDirectory
+  doesFileExist = lift . doesFileExist
+  doesDirectoryExist = lift . doesDirectoryExist
+  getFileSize = lift . getFileSize
+
+instance (MonadFSRead m) => MonadFSRead (StateT s m) where
+  listDirectory = lift . listDirectory
+  doesFileExist = lift . doesFileExist
+  doesDirectoryExist = lift . doesDirectoryExist
+  getFileSize = lift . getFileSize
+
+instance MonadFSWrite IO where
   removeFile = Dir.removeFile
   removeDirectory = Dir.removeDirectory
   renameFile = Dir.renameFile
   copyFileWithMetadata = Dir.copyFileWithMetadata
 
-instance (MonadFS m) => MonadFS (ReaderT e m) where
-  listDirectory = lift . listDirectory
-  doesFileExist = lift . doesFileExist
-  doesDirectoryExist = lift . doesDirectoryExist
-  getFileSize = lift . getFileSize
+instance (MonadFSWrite m) => MonadFSWrite (ReaderT e m) where
   removeFile = lift . removeFile
   removeDirectory = lift . removeDirectory
   renameFile = (lift .) . renameFile
   copyFileWithMetadata = (lift .) . copyFileWithMetadata
 
-instance (MonadFS m) => MonadFS (StateT s m) where
-  listDirectory = lift . listDirectory
-  doesFileExist = lift . doesFileExist
-  doesDirectoryExist = lift . doesDirectoryExist
-  getFileSize = lift . getFileSize
+instance (MonadFSWrite m) => MonadFSWrite (StateT s m) where
   removeFile = lift . removeFile
   removeDirectory = lift . removeDirectory
   renameFile = (lift .) . renameFile
@@ -551,19 +515,14 @@ renderDetails = mapM_ $ \d ->
       ++ maybe "" ((" @ " ++) . show) (d ^. captureTime)
 
 getFileDetails ::
-  (Alternative m, MonadChecksum m, MonadPhoto m, MonadFS m) =>
-  Bool ->
+  (Alternative m, MonadPhoto m, MonadFSRead m) =>
   FilePath ->
   m FileDetails
-getFileDetails computeChecksum path = do
+getFileDetails path = do
   isFile <- doesFileExist path
   unless isFile $
     error $
       "File does not exist: " ++ path
-  _checksum <-
-    if computeChecksum
-      then Just <$> fileChecksum path
-      else pure Nothing
   let _filepath = path
       _filedir = takeDirectory path
       _filename = takeFileName path
@@ -573,7 +532,6 @@ getFileDetails computeChecksum path = do
     if isImage _fileext
       then photoCaptureDate path
       else pure Nothing
-  let _fileIdx = -1
   _fileSize <- getFileSize path
   pure FileDetails {..}
 
@@ -585,11 +543,10 @@ registerFileDetails ::
 registerFileDetails mdest FileDetails {..} = do
   forM_ mdest $ \destDir ->
     registerCounter (destDir </>) _filebase
-  _fileIdx <- registerPath (_filedir </> _filename) _checksum
   pure FileDetails {..}
 
 walkFileEntries ::
-  (MonadFS m, MonadLog m) =>
+  (MonadFSRead m, MonadLog m) =>
   Bool ->
   (FilePath -> m a) ->
   FilePath ->
@@ -617,10 +574,9 @@ walkFileEntries recurse f path = do
 gatherDetails ::
   ( MonadReader Options m,
     MonadLog m,
-    MonadFS m,
+    MonadFSRead m,
     MonadJSON m,
     MonadParallel m,
-    MonadChecksum m,
     MonadPhoto m,
     Alternative m
   ) =>
@@ -631,8 +587,6 @@ gatherDetails = concatMapM $ \entry -> do
   -- tables:
   --   filepathToIdx
   --   idxToFilepath
-  --   fileChecksums
-  c <- view checksums
   recurse <- view recursive
   isDir <- doesDirectoryExist entry
   details <-
@@ -651,14 +605,14 @@ gatherDetails = concatMapM $ \entry -> do
             putStrLn_ Normal $ "Gathering details from " ++ show entry
             details <-
               parallelInterleaved
-                =<< walkFileEntries recurse (getFileDetails c) entry
+                =<< walkFileEntries recurse getFileDetails entry
             when stateful $
               encodeFile detailsFile details
             pure details
       else do
         putStrLn_ Normal $ "Gathering details from " ++ show entry
         parallelInterleaved
-          =<< walkFileEntries recurse (getFileDetails c) entry
+          =<< walkFileEntries recurse getFileDetails entry
   stopGlobalPool
   pure details
 
@@ -667,7 +621,7 @@ processDetails ::
   Maybe FilePath ->
   [FileDetails] ->
   m [FileDetails]
-processDetails mdest = mapM (registerFileDetails mdest)
+processDetails = mapM . registerFileDetails
 
 {-------------------------------------------------------------------------
  - Step 5: Naming
@@ -676,13 +630,13 @@ processDetails mdest = mapM (registerFileDetails mdest)
 yymmdd :: LocalTime -> String
 yymmdd = formatTime defaultTimeLocale "%y%m%d"
 
-nextSeqNum :: (Has e RenamerState, MonadState e m) => String -> m Int
+nextSeqNum :: (Has e RenamerState, MonadState e m) => String -> m Integer
 nextSeqNum ymd =
   preuse (within . dailyCounter . ix ymd) >>= \case
     Just idx -> idx <$ (within . dailyCounter . ix ymd += 1)
     Nothing -> 1 <$ (within . dailyCounter . at ymd ?= 2)
 
-nextUniqueNum :: (Has e RenamerState, MonadState e m) => m Int
+nextUniqueNum :: (Has e RenamerState, MonadState e m) => m Integer
 nextUniqueNum = do
   uniqueIdx <- use (within . uniqueCounter)
   within . uniqueCounter += 1
@@ -1024,8 +978,8 @@ renameFiles tz destDir ds = do
  -}
 
 data Mapping = Mapping
-  { _sourceFileIdx :: Int,
-    _targetFileIdx :: Int,
+  { _sourceFile :: FilePath,
+    _targetFile :: FilePath,
     _renamingRef :: RenamedFile
   }
   deriving (Show, Generic)
@@ -1037,7 +991,7 @@ instance ToJSON Mapping where
 
 instance FromJSON Mapping
 
-mappingSets :: [Mapping] -> (IntSet, IntSet)
+mappingSets :: [Mapping] -> (Set FilePath, Set FilePath)
 mappingSets = foldl' go (mempty, mempty)
   where
     go (srcSet, dstSet) (Mapping src dst _) =
@@ -1052,24 +1006,15 @@ renderMappings ::
   ) =>
   [Mapping] ->
   m ()
-renderMappings = mapM_ $ \(Mapping src dst _) -> do
-  Just (srcPath, _) <- use (within . idxToFilepath . at src)
-  Just (dstPath, _) <- use (within . idxToFilepath . at dst)
-  putStrLn_ Debug $ srcPath ++ " >>> " ++ dstPath
+renderMappings = mapM_ $ \(Mapping src dst _) ->
+  putStrLn_ Debug $ src ++ " >>> " ++ dst
 
 buildBasicPlan ::
-  (Has e RenamerState, MonadState e m, MonadProc m, MonadLog m, MonadFail m) =>
   Maybe FilePath ->
   [RenamedFile] ->
-  m [Mapping]
-buildBasicPlan destDir = foldrM go []
-  where
-    go ren rest = do
-      idx <-
-        registerPath
-          (target destDir ren)
-          (ren ^. sourceDetails . checksum)
-      pure $ Mapping (ren ^. sourceDetails . fileIdx) idx ren : rest
+  [Mapping]
+buildBasicPlan destDir = Prelude.map $ \ren ->
+  Mapping (ren ^. sourceDetails . filepath) (target destDir ren) ren
 
 safeguardPlan ::
   (Has e RenamerState, MonadState e m, MonadProc m, MonadLog m, MonadFail m) =>
@@ -1083,17 +1028,13 @@ safeguardPlan plan = do
     work pid (Mapping src dst ren) (rest, post)
       | dst `S.member` srcs = do
           uniqueIdx <- nextUniqueNum
-          Just (dstPath, csum) <- use (within . idxToFilepath . at dst)
-          idx <-
-            registerPath
-              ( takeDirectory dstPath
+          let tmp =
+                takeDirectory dst
                   </> "tmp_"
                   ++ show pid
                   ++ "_"
                   ++ show uniqueIdx
-              )
-              csum
-          pure (Mapping src idx ren : rest, Mapping idx dst ren : post)
+          pure (Mapping src tmp ren : rest, Mapping tmp dst ren : post)
       | otherwise =
           pure (Mapping src dst ren : rest, post)
 
@@ -1112,14 +1053,18 @@ buildPlan destDir rs = do
   reportIdempotentRenamings destDir rs
   reportOverlappedSources destDir rs
   reportOverlappedTargets destDir rs
-  buildBasicPlan destDir rs >>= safeguardPlan
+  safeguardPlan (buildBasicPlan destDir rs)
 
 {-------------------------------------------------------------------------
  - Step 7: Execute
  -}
 
 data Scenario = Scenario
-  { _scenarioDetails :: [FileDetails],
+  { _scenarioRepositories :: [FilePath],
+    _scenarioRepositoryDetails :: [FileDetails],
+    _scenarioInputs :: [FilePath],
+    _scenarioDestination :: Maybe FilePath,
+    _scenarioDetails :: [FileDetails],
     _scenarioRenamings :: RenamingSet,
     _scenarioMappings :: [Mapping]
   }
@@ -1135,13 +1080,82 @@ instance FromJSON Scenario
 newScenario :: Scenario
 newScenario =
   Scenario
-    { _scenarioDetails = [],
+    { _scenarioRepositories = [],
+      _scenarioRepositoryDetails = [],
+      _scenarioInputs = [],
+      _scenarioDestination = Nothing,
+      _scenarioDetails = [],
       _scenarioRenamings = newRenamingSet,
       _scenarioMappings = []
     }
 
+determineScenario ::
+  ( MonadReader Options m,
+    Has e RenamerState,
+    MonadState e m,
+    MonadProc m,
+    MonadFSRead m,
+    MonadJSON m,
+    MonadParallel m,
+    MonadPhoto m,
+    MonadLog m,
+    MonadFail m,
+    Alternative m
+  ) =>
+  TimeZone ->
+  [FilePath] ->
+  [FilePath] ->
+  Maybe FilePath ->
+  m Scenario
+determineScenario
+  tz
+  _scenarioRepositories
+  _scenarioInputs
+  _scenarioDestination = do
+    (_scenarioRepositoryDetails, _scenarioDetails) <- doGatherDetails
+    _scenarioRenamings <- doRenameFiles _scenarioDetails
+    _scenarioMappings <- doBuildPlan (_scenarioRenamings ^. allRenamings)
+    pure Scenario {..}
+    where
+      doGatherDetails = do
+        putStrLn_ Normal "Gathering details..."
+        rds <-
+          if null _scenarioRepositories
+            then pure []
+            else
+              sort
+                <$> ( gatherDetails _scenarioRepositories
+                        >>= processDetails _scenarioDestination
+                    )
+        ds <-
+          sort
+            <$> ( gatherDetails _scenarioInputs
+                    >>= processDetails _scenarioDestination
+                )
+        whenDebug $ renderDetails rds
+        whenDebug $ renderDetails ds
+        pure (rds, ds)
+
+      doRenameFiles details = do
+        putStrLn_ Normal $
+          "Determining expected file names (from "
+            ++ show (length details)
+            ++ " entries)..."
+        rs <- renameFiles tz _scenarioDestination details
+        whenDebug $ renderRenamings (rs ^. allRenamings)
+        pure rs
+
+      doBuildPlan renamings = do
+        putStrLn_ Normal $
+          "Building renaming plan (from "
+            ++ show (length renamings)
+            ++ " renamings)..."
+        p <- buildPlan _scenarioDestination renamings
+        whenDebug $ renderMappings p
+        pure p
+
 safeRemoveDirectory ::
-  (MonadReader Options m, MonadLog m, MonadFS m) =>
+  (MonadReader Options m, MonadLog m, MonadFSWrite m) =>
   FilePath ->
   m ()
 safeRemoveDirectory path = do
@@ -1150,7 +1164,7 @@ safeRemoveDirectory path = do
   unless dry $ removeDirectory path
 
 safePruneDirectory ::
-  (MonadReader Options m, MonadLog m, MonadFS m) =>
+  (MonadReader Options m, MonadLog m, MonadFSRead m, MonadFSWrite m) =>
   FilePath ->
   m ()
 safePruneDirectory path = do
@@ -1166,7 +1180,7 @@ safePruneDirectory path = do
     safeRemoveDirectory path
 
 safeRemoveFile ::
-  (MonadReader Options m, MonadLog m, MonadFS m) =>
+  (MonadReader Options m, MonadLog m, MonadFSWrite m) =>
   FilePath ->
   m ()
 safeRemoveFile path = do
@@ -1176,96 +1190,57 @@ safeRemoveFile path = do
 
 safeMoveFile ::
   ( MonadReader Options m,
-    Has e RenamerState,
-    MonadState e m,
     MonadLog m,
-    MonadFS m,
-    MonadChecksum m
+    MonadFSRead m,
+    MonadFSWrite m
   ) =>
   (FilePath -> FilePath -> String) ->
   FilePath ->
-  Maybe Checksum ->
   FilePath ->
-  m ()
-safeMoveFile label src srcSum dst
+  m Integer
+safeMoveFile label src dst
   | strToLower src == strToLower dst = do
       putStrLn_ Verbose $ src ++ " => " ++ dst
       dry <- not <$> view execute
       unless dry $ renameFile src dst
+      pure 0
   | otherwise = do
-      shouldMove <- case srcSum of
-        Just csum ->
-          preuse (within . fileChecksums . ix csum) >>= \case
-            Just _ -> pure False
-            _ -> pure True
-        Nothing -> pure True
-      if shouldMove
-        then do
-          putStrLn_ Verbose $ label src dst
-          dry <- not <$> view execute
-          unless dry $ do
-            csum <- case srcSum of
-              Just csum -> pure csum
-              Nothing -> do
-                isFile <- doesFileExist src
-                -- This can be False if we are not in --execute mode, and the
-                -- move is from a temp file that was never created.
-                if isFile
-                  then fileChecksum src
-                  else pure ""
-            isFile <- doesFileExist dst
-            if isFile
-              then do
-                c <- view checksums
-                if c
-                  then do
-                    csum' <- fileChecksum dst
-                    if csum == csum'
-                      then safeRemoveFile src
-                      else
-                        logErr $
-                          "Destination already exists, cannot copy: "
-                            ++ label src dst
-                  else
-                    logErr $
-                      "Destination already exists, cannot copy: "
-                        ++ label src dst
-              else do
-                copyFileWithMetadata src dst
-                csum' <- fileChecksum dst
-                if csum == csum'
-                  then safeRemoveFile src
-                  else logErr $ "Checksum mismatch: " ++ csum ++ " != " ++ csum'
+      putStrLn_ Verbose $ label src dst
+      dry <- not <$> view execute
+      if dry
+        then pure 0
         else do
-          putStrLn_ Normal $ "INFO: Duplicate: " ++ src
-          safeRemoveFile src
+          isFile <- doesFileExist dst
+          if isFile
+            then do
+              logErr' $
+                "Destination already exists, cannot copy: "
+                  ++ label src dst
+              pure 1
+            else do
+              copyFileWithMetadata src dst
+              safeRemoveFile src
+              pure 0
 
 executePlan ::
   ( MonadReader Options m,
-    Has e RenamerState,
-    MonadState e m,
     MonadLog m,
-    MonadFS m,
-    MonadChecksum m,
+    MonadFSRead m,
+    MonadFSWrite m,
     MonadFail m
   ) =>
   TimeZone ->
   [Mapping] ->
-  m ()
+  m Integer
 executePlan tz plan = do
-  errors <- use (within . errorCount)
-  if errors > 0
-    then logErr "Cannot execute renaming plan with errors"
-    else do
-      putStrLn_ Normal $
-        "Executing renaming plan ("
-          ++ show (length plan)
-          ++ " operations)..."
-      forM_ plan $ \(Mapping src dst ren) -> do
-        Just (srcPath, csum) <- use (within . idxToFilepath . at src)
-        Just (dstPath, _) <- use (within . idxToFilepath . at dst)
-        safeMoveFile (renamingLabel tz ren) srcPath csum dstPath
-      putStrLn_ Normal "Renaming complete!"
+  putStrLn_ Normal $
+    "Executing renaming plan ("
+      ++ show (length plan)
+      ++ " operations)..."
+  results <- forM plan $ \(Mapping src dst ren) ->
+    safeMoveFile (renamingLabel tz ren) src dst
+  putStrLn_ Normal "Renaming complete!"
+  pure $ sum results
 
 type AppT m = ReaderT Options (StateT RenamerState m)
 

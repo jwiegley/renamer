@@ -1,12 +1,14 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RecordWildCards #-}
 
 module Main where
 
 import Control.Lens hiding ((<.>))
+import Control.Monad (when)
 import Control.Monad.IO.Class
-import Data.List (sort)
+import Data.Foldable (forM_)
 import Data.Time
 import GHC.Conc (setNumCapabilities)
 import Options.Applicative hiding (command)
@@ -35,16 +37,14 @@ main :: IO ()
 main = do
   (opts, cmd) <- getOptions
   _ <- GHC.Conc.setNumCapabilities (opts ^. jobs)
-  errors <- runAppT opts $ do
-    case cmd of
-      RenamePhotos dirs ->
-        renamePhotos dirs
-      ImportPhotos froms toPath dirs ->
-        importPhotos froms toPath dirs
-    use errorCount
+  errors <- runAppT opts $ case cmd of
+    RenamePhotos repos ->
+      renamePhotos repos
+    ImportPhotos repos destDir inputs ->
+      importPhotos repos inputs destDir
   if errors == 0
     then exitSuccess
-    else exitWith (ExitFailure errors)
+    else exitWith (ExitFailure (fromIntegral errors))
   where
     getOptions :: IO (Options, Command)
     getOptions = execParser optionsDefinition
@@ -121,11 +121,6 @@ main = do
               <> help "Number of concurrent IO jobs (default: 1)"
           )
         <*> switch
-          ( short 'c'
-              <> long "checksum"
-              <> help "Compute file checksums to detect duplicates"
-          )
-        <*> switch
           ( short 'r'
               <> long "recursive"
               <> help "Recurse into directories provided on the command-line"
@@ -155,45 +150,38 @@ main = do
               )
           )
 
-buildAndExecutePlan :: [FilePath] -> Maybe FilePath -> AppT IO ()
-buildAndExecutePlan dirs mdest = do
+buildAndExecutePlan ::
+  [FilePath] ->
+  [FilePath] ->
+  Maybe FilePath ->
+  AppT IO Integer
+buildAndExecutePlan repos inputs mdest = do
   tz <- liftIO $ getTimeZone =<< getCurrentTime
-  scenario <- do
-    _scenarioDetails <- doGatherDetails
-    _scenarioRenamings <- doRenameFiles tz _scenarioDetails
-    _scenarioMappings <- doBuildPlan (_scenarioRenamings ^. allRenamings)
-    pure Scenario {..}
-  executePlan tz (scenario ^. scenarioMappings)
-  where
-    doGatherDetails = do
-      putStrLn_ Normal "Gathering details..."
-      ds <- sort <$> (processDetails mdest =<< gatherDetails dirs)
-      whenDebug $ renderDetails ds
-      pure ds
+  mfromPath <- view scenarioFrom
+  scenario <- case mfromPath of
+    Just fromPath ->
+      decodeFileStrict fromPath >>= \case
+        Just s
+          | s ^. scenarioRepositories == repos
+              && s ^. scenarioInputs == inputs
+              && s ^. scenarioDestination == mdest ->
+              pure s
+        _ -> determineScenario tz repos inputs mdest
+    Nothing -> determineScenario tz repos inputs mdest
+  mtoPath <- view scenarioTo
+  forM_ mtoPath $ encodeFile ?? scenario
+  errors <- use (within . errorCount)
+  if errors > 0
+    then do
+      logErr "Cannot execute renaming plan with errors"
+      pure errors
+    else executePlan tz (scenario ^. scenarioMappings)
 
-    doRenameFiles tz details = do
-      putStrLn_ Normal $
-        "Determining expected file names (from "
-          ++ show (length details)
-          ++ " entries)..."
-      rs <- renameFiles tz mdest details
-      whenDebug $ renderRenamings (rs ^. allRenamings)
-      pure rs
+renamePhotos :: [FilePath] -> AppT IO Integer
+renamePhotos = buildAndExecutePlan [] ?? Nothing
 
-    doBuildPlan renamings = do
-      putStrLn_ Normal $
-        "Building renaming plan (from "
-          ++ show (length renamings)
-          ++ " renamings)..."
-      p <- buildPlan mdest renamings
-      whenDebug $ renderMappings p
-      pure p
-
-renamePhotos :: [FilePath] -> AppT IO ()
-renamePhotos = buildAndExecutePlan ?? Nothing
-
-importPhotos :: [FilePath] -> FilePath -> [FilePath] -> AppT IO ()
-importPhotos froms toPath dirs = do
-  _ <- processDetails (Just toPath) =<< gatherDetails dirs
-  buildAndExecutePlan froms (Just toPath)
-  mapM_ safePruneDirectory froms
+importPhotos :: [FilePath] -> [FilePath] -> FilePath -> AppT IO Integer
+importPhotos repos inputs destDir = do
+  errors <- buildAndExecutePlan repos inputs (Just destDir)
+  when (errors == 0) $ mapM_ safePruneDirectory inputs
+  pure errors
