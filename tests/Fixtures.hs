@@ -1,7 +1,9 @@
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
@@ -26,6 +28,7 @@ import GHC.Generics
 import Renamer
 import System.FilePath
 import System.Process (Pid)
+import Test.Tasty
 import Test.Tasty.HUnit
 import Text.Show.Pretty
 
@@ -206,6 +209,79 @@ allPaths = go "" <$> use envFileTree
 
 runWithFixture :: (Monad m) => EnvT m a -> m a
 runWithFixture = flip (evalStateT . runEnvT) (Env 123 (DirEntry mempty))
+
+runWithFixtureAtPid :: (Monad m) => Pid -> EnvT m a -> m a
+runWithFixtureAtPid pid =
+  flip (evalStateT . runEnvT) (Env pid (DirEntry mempty))
+
+confirmScenario ::
+  (MonadLog m, MonadIO m, MonadPlus m, MonadFail m, MonadProc m) =>
+  Scenario ->
+  m ()
+confirmScenario Scenario {..} = do
+  runAppT
+    ( defaultOptions
+        { _quiet = True,
+          -- _quiet = False,
+          -- _verbose = True,
+          -- _debug = True,
+          _recursive = True,
+          _execute = True
+        }
+    )
+    $ do
+      (rds, ds) <- doProcessDetails
+      renamings <-
+        doRenameFiles
+          ( if null ds
+              then rds
+              else ds
+          )
+      _scenarioRenamings @?== renamings
+      mappings <- doBuildPlan (renamings ^. allRenamings)
+      _scenarioMappings @?== mappings
+  where
+    doProcessDetails = do
+      putStrLn_ Normal "Processing details..."
+      rds <-
+        if null _scenarioRepository
+          then pure []
+          else processDetails _scenarioDestination (sort _scenarioRepository)
+      whenDebug $ renderDetails rds
+      ds <- processDetails _scenarioDestination (sort _scenarioInputs)
+      whenDebug $ renderDetails ds
+      pure (rds, ds)
+
+    doRenameFiles details = do
+      putStrLn_ Normal $
+        "Determining expected file names (from "
+          ++ show (length details)
+          ++ " entries)..."
+      rs <-
+        renameFiles
+          (minutesToTimeZone _scenarioTimeZoneMinutes)
+          _scenarioDestination
+          details
+      whenDebug $ renderRenamings (rs ^. allRenamings)
+      pure rs
+
+    doBuildPlan renamings = do
+      putStrLn_ Normal $
+        "Building renaming plan (from "
+          ++ show (length renamings)
+          ++ " renamings)..."
+      p <- buildPlan _scenarioDestination renamings
+      whenDebug $ renderMappings p
+      pure p
+
+testScenario :: FilePath -> TestTree
+testScenario path =
+  testCase path $ do
+    decodeFileStrict path >>= \case
+      Just scenario ->
+        runWithFixtureAtPid (fromIntegral (scenario ^. scenarioPid)) $
+          confirmScenario scenario
+      Nothing -> error $ "Failed to read scenario from " ++ path
 
 renamerExecute ::
   (MonadLog m, MonadIO m, MonadPlus m, MonadFail m) =>

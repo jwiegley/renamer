@@ -1,23 +1,13 @@
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE RecordWildCards #-}
 
 module Main where
 
-import Control.Lens hiding ((<.>))
-import Control.Monad (when)
-import Control.Monad.IO.Class
-import Data.Foldable (forM_)
-import Data.Time
+import Data.Time (getCurrentTime, getTimeZone)
 import GHC.Conc (setNumCapabilities)
 import Options.Applicative hiding (command)
 import Options.Applicative qualified as OA
-import Renamer
-import System.Exit
-import System.FilePath
-import Text.Regex.TDFA.String ()
-import Prelude hiding (putStrLn)
+import Renamer (Command (..), Options (..), renamePhotos, runAppT)
+import System.Exit (ExitCode (ExitFailure), exitSuccess, exitWith)
 
 version :: String
 version = "0.0.1"
@@ -36,12 +26,13 @@ summary =
 main :: IO ()
 main = do
   (opts, cmd) <- getOptions
-  _ <- GHC.Conc.setNumCapabilities (opts ^. jobs)
+  _ <- GHC.Conc.setNumCapabilities (_jobs opts)
+  tz <- getTimeZone =<< getCurrentTime
   errors <- runAppT opts $ case cmd of
     RenamePhotos repos ->
-      renamePhotos repos
+      renamePhotos tz repos [] Nothing
     ImportPhotos repos destDir inputs ->
-      importPhotos repos inputs destDir
+      renamePhotos tz repos inputs (Just destDir)
   if errors == 0
     then exitSuccess
     else exitWith (ExitFailure (fromIntegral errors))
@@ -143,45 +134,3 @@ main = do
                   <> help "Write calculated scenario to FILE"
               )
           )
-        <*> optional
-          ( strOption
-              ( long "read-scenario"
-                  <> help "Read calculated scenario from FILE"
-              )
-          )
-
-buildAndExecutePlan ::
-  [FilePath] ->
-  [FilePath] ->
-  Maybe FilePath ->
-  AppT IO Integer
-buildAndExecutePlan repos inputs mdest = do
-  tz <- liftIO $ getTimeZone =<< getCurrentTime
-  mfromPath <- view scenarioFrom
-  scenario <- case mfromPath of
-    Just fromPath ->
-      decodeFileStrict fromPath >>= \case
-        Just s
-          | s ^. scenarioRepositories == repos
-              && s ^. scenarioInputs == inputs
-              && s ^. scenarioDestination == mdest ->
-              pure s
-        _ -> determineScenario tz repos inputs mdest
-    Nothing -> determineScenario tz repos inputs mdest
-  mtoPath <- view scenarioTo
-  forM_ mtoPath $ encodeFile ?? scenario
-  errors <- use (within . errorCount)
-  if errors > 0
-    then do
-      logErr "Cannot execute renaming plan with errors"
-      pure errors
-    else executePlan tz (scenario ^. scenarioMappings)
-
-renamePhotos :: [FilePath] -> AppT IO Integer
-renamePhotos = buildAndExecutePlan [] ?? Nothing
-
-importPhotos :: [FilePath] -> [FilePath] -> FilePath -> AppT IO Integer
-importPhotos repos inputs destDir = do
-  errors <- buildAndExecutePlan repos inputs (Just destDir)
-  when (errors == 0) $ mapM_ safePruneDirectory inputs
-  pure errors

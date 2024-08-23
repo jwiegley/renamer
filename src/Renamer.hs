@@ -31,6 +31,7 @@ import Data.List.NonEmpty (NonEmpty (..))
 import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
+import Data.Maybe (isJust)
 import Data.Set (Set)
 import Data.Set qualified as S
 import Data.Time
@@ -212,8 +213,7 @@ data Options = Options
     _execute :: !Bool,
     _keepState :: !Bool,
     _spanDirectories :: !Bool,
-    _scenarioTo :: !(Maybe FilePath),
-    _scenarioFrom :: !(Maybe FilePath)
+    _scenarioTo :: !(Maybe FilePath)
   }
   deriving (Show, Eq)
 
@@ -230,8 +230,7 @@ defaultOptions =
       _execute = False,
       _keepState = False,
       _spanDirectories = False,
-      _scenarioTo = Nothing,
-      _scenarioFrom = Nothing
+      _scenarioTo = Nothing
     }
 
 class (Monad m) => MonadLog m where
@@ -896,7 +895,7 @@ data RenamingSet = RenamingSet
     --   clear of idempotent, redundant and overlapped renamings.
     _allRenamings :: [RenamedFile]
   }
-  deriving (Show, Generic)
+  deriving (Eq, Show, Generic)
 
 makeLenses ''RenamingSet
 
@@ -982,7 +981,7 @@ data Mapping = Mapping
     _targetFile :: FilePath,
     _renamingRef :: RenamedFile
   }
-  deriving (Show, Generic)
+  deriving (Eq, Show, Generic)
 
 makeLenses ''Mapping
 
@@ -1060,11 +1059,11 @@ buildPlan destDir rs = do
  -}
 
 data Scenario = Scenario
-  { _scenarioRepositories :: [FilePath],
-    _scenarioRepositoryDetails :: [FileDetails],
-    _scenarioInputs :: [FilePath],
+  { _scenarioPid :: Int,
+    _scenarioTimeZoneMinutes :: Int,
+    _scenarioRepository :: [FileDetails],
     _scenarioDestination :: Maybe FilePath,
-    _scenarioDetails :: [FileDetails],
+    _scenarioInputs :: [FileDetails],
     _scenarioRenamings :: RenamingSet,
     _scenarioMappings :: [Mapping]
   }
@@ -1080,11 +1079,11 @@ instance FromJSON Scenario
 newScenario :: Scenario
 newScenario =
   Scenario
-    { _scenarioRepositories = [],
-      _scenarioRepositoryDetails = [],
-      _scenarioInputs = [],
+    { _scenarioPid = 0,
+      _scenarioTimeZoneMinutes = 0,
+      _scenarioRepository = [],
       _scenarioDestination = Nothing,
-      _scenarioDetails = [],
+      _scenarioInputs = [],
       _scenarioRenamings = newRenamingSet,
       _scenarioMappings = []
     }
@@ -1112,8 +1111,15 @@ determineScenario
   _scenarioRepositories
   _scenarioInputs
   _scenarioDestination = do
-    (_scenarioRepositoryDetails, _scenarioDetails) <- doGatherDetails
-    _scenarioRenamings <- doRenameFiles _scenarioDetails
+    _scenarioPid <- fromIntegral <$> getCurrentPid
+    let _scenarioTimeZoneMinutes = timeZoneMinutes tz
+    (_scenarioRepository, _scenarioInputs) <- doGatherDetails
+    _scenarioRenamings <-
+      doRenameFiles
+        ( if null _scenarioInputs
+            then _scenarioRepository
+            else _scenarioInputs
+        )
     _scenarioMappings <- doBuildPlan (_scenarioRenamings ^. allRenamings)
     pure Scenario {..}
     where
@@ -1123,15 +1129,11 @@ determineScenario
           if null _scenarioRepositories
             then pure []
             else
-              sort
-                <$> ( gatherDetails _scenarioRepositories
-                        >>= processDetails _scenarioDestination
-                    )
+              gatherDetails _scenarioRepositories
+                >>= processDetails _scenarioDestination . sort
         ds <-
-          sort
-            <$> ( gatherDetails _scenarioInputs
-                    >>= processDetails _scenarioDestination
-                )
+          gatherDetails _scenarioInputs
+            >>= processDetails _scenarioDestination . sort
         whenDebug $ renderDetails rds
         whenDebug $ renderDetails ds
         pure (rds, ds)
@@ -1241,6 +1243,40 @@ executePlan tz plan = do
     safeMoveFile (renamingLabel tz ren) src dst
   putStrLn_ Normal "Renaming complete!"
   pure $ sum results
+
+renamePhotos ::
+  ( Alternative m,
+    MonadFSRead m,
+    MonadFSWrite m,
+    MonadFail m,
+    MonadJSON m,
+    MonadLog m,
+    MonadParallel m,
+    MonadPhoto m,
+    MonadProc m,
+    MonadReader Options m,
+    Has e RenamerState,
+    MonadState e m
+  ) =>
+  TimeZone ->
+  [FilePath] ->
+  [FilePath] ->
+  Maybe FilePath ->
+  m Integer
+renamePhotos tz repos inputs mdest = do
+  scenario <- determineScenario tz repos inputs mdest
+  mtoPath <- view scenarioTo
+  forM_ mtoPath $ encodeFile ?? scenario
+  errors <- use (within . errorCount)
+  if errors > 0
+    then do
+      logErr "Cannot execute renaming plan with errors"
+      pure errors
+    else do
+      errors' <- executePlan tz (scenario ^. scenarioMappings)
+      when (errors' == 0 && isJust mdest) $
+        mapM_ safePruneDirectory inputs
+      pure errors'
 
 type AppT m = ReaderT Options (StateT RenamerState m)
 
