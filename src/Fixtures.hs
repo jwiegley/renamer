@@ -12,10 +12,10 @@
 
 module Fixtures where
 
-import Control.Applicative (Alternative)
 import Control.Lens
-import Control.Monad (MonadPlus, unless, when)
+import Control.Monad (unless)
 import Control.Monad.IO.Class
+import Control.Monad.Reader
 import Control.Monad.State
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HM
@@ -32,6 +32,20 @@ import Test.Tasty
 import Test.Tasty.HUnit
 import Text.Show.Pretty
 
+(@?==) :: (Eq a, Show a, HasCallStack, MonadIO m) => a -> a -> m ()
+actual @?== expected = liftIO $ assertEqual' "" expected actual
+
+assertEqual' :: (Eq a, Show a, HasCallStack) => String -> a -> a -> Assertion
+assertEqual' preface expected actual =
+  unless (actual == expected) $ assertFailure msg
+  where
+    msg =
+      (if null preface then "" else preface ++ "\n")
+        ++ "expected: "
+        ++ ppShow expected
+        ++ "\n but got: "
+        ++ ppShow actual
+
 data FileTree
   = FileEntry (Maybe UTCTime) Integer
   | DirEntry (HashMap FilePath FileTree)
@@ -47,38 +61,33 @@ data Env = Env
 
 makeLenses ''Env
 
-newtype EnvT m a = EnvT {runEnvT :: StateT Env m a}
+newtype Simulation a = Simulation {getSimulation :: State Env a}
   deriving
     ( Generic,
       Functor,
       Applicative,
       Monad,
-      MonadIO,
-      MonadState Env,
-      Alternative,
-      MonadPlus,
-      MonadTrans,
-      MonadFail
+      MonadState Env
     )
 
-instance (Monad m) => MonadLog (EnvT m) where
+instance MonadLog Simulation where
   printLog = traceM
 
-instance (Monad m) => MonadProc (EnvT m) where
+instance MonadProc Simulation where
   getCurrentPid = use envPid
 
-instance (Monad m) => MonadParallel (EnvT m) where
+instance MonadParallel Simulation where
   parallelInterleaved = sequence
   stopGlobalPool = pure ()
 
-instance (Monad m) => MonadPhoto (EnvT m) where
+instance MonadPhoto Simulation where
   photoCaptureDate path = do
     t <- use envFileTree
     pure $ case lookupPath t path of
       Just (FileEntry tm _) -> tm
       _ -> Nothing
 
-instance (Monad m) => MonadJSON (EnvT m) where
+instance MonadJSON Simulation where
   decodeFileStrict _ = error "decodeFileStrict not used"
   encodeFile _ _ = error "encodeFile not used"
 
@@ -111,7 +120,15 @@ adjustPath tree path f = go tree (splitDirectories path)
             | null ss -> f (Just x)
             | otherwise -> Just (go x ss)
 
-instance (Monad m) => MonadFSRead (EnvT m) where
+loadDetails :: [FileDetails] -> Simulation ()
+loadDetails = mapM_ $ \d ->
+  envFileTree %= \t ->
+    adjustPath
+      t
+      (d ^. filepath)
+      (const (Just (FileEntry (d ^. captureTime) (d ^. filesize))))
+
+instance MonadFSRead Simulation where
   listDirectory path = do
     t <- use envFileTree
     case lookupPath t path of
@@ -133,7 +150,7 @@ instance (Monad m) => MonadFSRead (EnvT m) where
       Just (FileEntry _ sz) -> pure sz
       _ -> error $ "Not a file: " ++ path
 
-instance (Monad m) => MonadFSWrite (EnvT m) where
+instance MonadFSWrite Simulation where
   removeFile path = do
     t <- use envFileTree
     case lookupPath t path of
@@ -166,7 +183,7 @@ instance (Monad m) => MonadFSWrite (EnvT m) where
 time :: String -> UTCTime
 time = fromJust . iso8601ParseM
 
-photo :: (Monad m) => FilePath -> String -> EnvT m ()
+photo :: FilePath -> String -> Simulation ()
 photo path tm =
   envFileTree %= \t ->
     adjustPath
@@ -174,7 +191,7 @@ photo path tm =
       path
       (const (Just (FileEntry (Just (time tm)) 100)))
 
-file :: (Monad m) => FilePath -> EnvT m ()
+file :: FilePath -> Simulation ()
 file path =
   envFileTree %= \t ->
     adjustPath
@@ -195,52 +212,59 @@ followBase details name n = RenamedFile details name (FollowBase n)
 followTime :: FileDetails -> String -> String -> RenamedFile
 followTime details name n = RenamedFile details name (FollowTime n)
 
-ls :: (MonadLog m) => EnvT m ()
+ls :: Simulation ()
 ls = do
   t <- use envFileTree
   printLog $ ppShow t
 
-allPaths :: (Monad m) => EnvT m [FilePath]
+allPaths :: Simulation [FilePath]
 allPaths = go "" <$> use envFileTree
   where
     go name (FileEntry _ _) = [name]
     go name (DirEntry xs) =
       concatMap (\(n, x) -> go (name </> n) x) (sortOn fst (HM.toList xs))
 
-runWithFixture :: (Monad m) => EnvT m a -> m a
-runWithFixture = flip (evalStateT . runEnvT) (Env 123 (DirEntry mempty))
+runSimulation :: Simulation a -> a
+runSimulation = flip (evalState . getSimulation) (Env 123 (DirEntry mempty))
 
-runWithFixtureAtPid :: (Monad m) => Pid -> EnvT m a -> m a
-runWithFixtureAtPid pid =
-  flip (evalStateT . runEnvT) (Env pid (DirEntry mempty))
+runSimulationAtPid :: Pid -> Simulation a -> a
+runSimulationAtPid pid =
+  flip (evalState . getSimulation) (Env pid (DirEntry mempty))
 
 confirmScenario ::
-  (MonadLog m, MonadIO m, MonadPlus m, MonadFail m, MonadProc m) =>
+  (MonadLog m, MonadIO m, MonadProc m) =>
   Scenario ->
   m ()
 confirmScenario Scenario {..} = do
-  runAppT
-    ( defaultOptions
-        { _quiet = True,
-          -- _quiet = False,
-          -- _verbose = True,
-          -- _debug = True,
-          _recursive = True,
-          _execute = True
-        }
-    )
-    $ do
+  _scenarioRenamings @?== renamings
+  _scenarioMappings @?== mappings
+  where
+    (renamings, mappings) =
+      runSimulationAtPid (fromIntegral _scenarioPid) $
+        runAppT
+          ( defaultOptions
+              { _quiet = True,
+                -- _quiet = False,
+                -- _verbose = True,
+                -- _debug = True,
+                _recursive = True,
+                _execute = True
+              }
+          )
+          runScenario
+
+    runScenario :: AppT Simulation (RenamingSet, [Mapping])
+    runScenario = do
       (rds, ds) <- doProcessDetails
-      renamings <-
+      rs <-
         doRenameFiles
           ( if null ds
               then rds
               else ds
           )
-      _scenarioRenamings @?== renamings
-      mappings <- doBuildPlan (renamings ^. allRenamings)
-      _scenarioMappings @?== mappings
-  where
+      ms <- doBuildPlan (rs ^. allRenamings)
+      pure (rs, ms)
+
     doProcessDetails = do
       putStrLn_ Normal "Processing details..."
       rds <-
@@ -265,12 +289,12 @@ confirmScenario Scenario {..} = do
       whenDebug $ renderRenamings (rs ^. allRenamings)
       pure rs
 
-    doBuildPlan renamings = do
+    doBuildPlan rs = do
       putStrLn_ Normal $
         "Building renaming plan (from "
-          ++ show (length renamings)
+          ++ show (length rs)
           ++ " renamings)..."
-      p <- buildPlan _scenarioDestination renamings
+      p <- buildPlan _scenarioDestination rs
       whenDebug $ renderMappings p
       pure p
 
@@ -278,46 +302,71 @@ testScenario :: FilePath -> TestTree
 testScenario path =
   testCase path $ do
     decodeFileStrict path >>= \case
-      Just scenario ->
-        runWithFixtureAtPid (fromIntegral (scenario ^. scenarioPid)) $
-          confirmScenario scenario
+      Just scenario -> confirmScenario scenario
       Nothing -> error $ "Failed to read scenario from " ++ path
 
-renamerExecute ::
-  (MonadLog m, MonadIO m, MonadPlus m, MonadFail m) =>
-  Scenario ->
-  EnvT m [FilePath]
-renamerExecute scenario = do
-  runAppT
-    ( defaultOptions
-        { _quiet = True,
-          -- _quiet = False,
-          -- _verbose = True,
-          -- _debug = True,
-          _recursive = True,
-          _execute = True
-        }
-    )
-    $ do
-      errors <- use (within . errorCount)
-      when (errors > 0) $
-        error "Cannot execute renaming plan with errors"
-      errors' <- executePlan utc (scenario ^. scenarioMappings)
-      lift $ errors' @?== 0
-  allPaths
-
 renamerNoIdemCheck ::
-  (MonadLog m, MonadIO m, MonadPlus m, MonadFail m) =>
   [FilePath] ->
   [FilePath] ->
   Maybe FilePath ->
-  EnvT m (Scenario, [FilePath])
+  Simulation ((Scenario, Integer), [FilePath])
 renamerNoIdemCheck
   _scenarioRepositories
   _scenarioInputs
   _scenarioDestination = do
-    scenario <-
-      runAppT
+    res <- runAppT
+      ( defaultOptions
+          { _quiet = True,
+            -- _quiet = False,
+            -- _verbose = True,
+            -- _debug = True,
+            _recursive = True,
+            _execute = True
+          }
+      )
+      $ do
+        s <-
+          determineScenario
+            utc
+            _scenarioRepositories
+            _scenarioInputs
+            _scenarioDestination
+        (s,) <$> renamerExecute utc s
+    (res,) <$> allPaths
+
+renamer ::
+  (MonadIO m) =>
+  [FilePath] ->
+  [FilePath] ->
+  Maybe FilePath ->
+  Simulation () ->
+  m (Scenario, [FilePath])
+renamer repos inputs destDir setup = do
+  errors @?== 0
+  errors' @?== 0
+  paths @?== paths'
+  pure (scenario, paths')
+  where
+    (scenario, errors, paths, errors', paths') = runSimulation $ do
+      setup
+      ((s, es), ps) <- renamerNoIdemCheck repos inputs destDir
+      ((_, es'), ps') <- renamerNoIdemCheck (reverse ps) [] Nothing
+      pure (s, es, ps, es', ps')
+
+importer ::
+  (MonadIO m) =>
+  [FilePath] ->
+  [FilePath] ->
+  FilePath ->
+  Simulation () ->
+  m [FilePath]
+importer paths froms destDir setup = do
+  errors' @?== 0
+  pure paths'
+  where
+    (errors', paths') = runSimulation $ do
+      setup
+      es <- runAppT
         ( defaultOptions
             { _quiet = True,
               -- _quiet = False,
@@ -327,64 +376,18 @@ renamerNoIdemCheck
               _execute = True
             }
         )
-        $ determineScenario
-          utc
-          _scenarioRepositories
-          _scenarioInputs
-          _scenarioDestination
-    (scenario,) <$> renamerExecute scenario
+        $ do
+          _ <-
+            gatherDetails paths
+              >>= processDetails (Just destDir)
+          gatherDetails froms
+            >>= processDetails (Just destDir)
+            >>= renameFiles utc (Just destDir)
+            >>= buildPlan (Just destDir) . (^. allRenamings)
+            >>= executePlan utc
+      (es,) <$> allPaths
 
-renamer ::
-  (MonadIO m, MonadPlus m, MonadFail m, MonadLog m) =>
-  [FilePath] ->
-  [FilePath] ->
-  Maybe FilePath ->
-  EnvT m (Scenario, [FilePath])
-renamer repos inputs destDir = do
-  (scenario, paths') <- renamerNoIdemCheck repos inputs destDir
-  (_, paths'') <- renamerNoIdemCheck (reverse paths') [] Nothing
-  liftIO $ paths'' @?= paths'
-  pure (scenario, paths')
+type AppT m = ReaderT Options (StateT RenamerState m)
 
-importer ::
-  (MonadIO m, MonadPlus m, MonadFail m) =>
-  [FilePath] ->
-  [FilePath] ->
-  FilePath ->
-  EnvT m [FilePath]
-importer paths froms destDir = do
-  errors' <- runAppT
-    ( defaultOptions
-        { _quiet = True,
-          -- _quiet = False,
-          -- _verbose = True,
-          -- _debug = True,
-          _recursive = True,
-          _execute = True
-        }
-    )
-    $ do
-      _ <-
-        gatherDetails paths
-          >>= processDetails (Just destDir)
-      gatherDetails froms
-        >>= processDetails (Just destDir)
-        >>= renameFiles utc (Just destDir)
-        >>= buildPlan (Just destDir) . (^. allRenamings)
-        >>= executePlan utc
-  errors' @?== 0
-  allPaths
-
-(@?==) :: (Eq a, Show a, HasCallStack, MonadIO m) => a -> a -> m ()
-actual @?== expected = liftIO $ assertEqual' "" expected actual
-
-assertEqual' :: (Eq a, Show a, HasCallStack) => String -> a -> a -> Assertion
-assertEqual' preface expected actual =
-  unless (actual == expected) $ assertFailure msg
-  where
-    msg =
-      (if null preface then "" else preface ++ "\n")
-        ++ "expected: "
-        ++ ppShow expected
-        ++ "\n but got: "
-        ++ ppShow actual
+runAppT :: (Monad m) => Options -> AppT m a -> m a
+runAppT opts k = evalStateT (runReaderT k opts) newRenamerState

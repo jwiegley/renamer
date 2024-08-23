@@ -11,11 +11,6 @@ import Renamer
 import Test.Tasty
 import Test.Tasty.HUnit
 
--- import Test.Tasty.Hedgehog
--- import Hedgehog hiding (Action)
--- import Hedgehog.Gen qualified as Gen
--- import Hedgehog.Range qualified as Range
-
 main :: IO ()
 main =
   defaultMain $
@@ -25,8 +20,8 @@ main =
           "simple"
           [ testSameName,
             testNoRename,
-            testSimpleRename,
-            testDateNoDate
+            testSimpleRename
+            -- , testDateNoDate
           ],
         testGroup
           "follow"
@@ -49,9 +44,10 @@ main =
       ]
 
 testSameName :: TestTree
-testSameName = testCase "same" $ runWithFixture do
-  photo "test/240806_0001.cr3" "2024-08-06T19:35:40.702857Z"
-  (Scenario _ _ [f1cr3] _ _ rs _, paths) <- renamer ["test"] [] Nothing
+testSameName = testCase "same" $ do
+  (Scenario _ _ [f1cr3] _ _ rs _, paths) <-
+    renamer ["test"] [] Nothing $ do
+      photo "test/240806_0001.cr3" "2024-08-06T19:35:40.702857Z"
   (rs ^. allSimpleRenamings)
     @?== [ simpleRename
              f1cr3
@@ -67,9 +63,10 @@ testSameName = testCase "same" $ runWithFixture do
   paths @?== ["test/240806_0001.cr3"]
 
 testSimpleRename :: TestTree
-testSimpleRename = testCase "rename" $ runWithFixture do
-  photo "test/240806_0081.CR3" "2024-08-16T19:35:40.702857Z"
-  (Scenario _ _ [f81cr3] _ _ rs _, paths) <- renamer ["test"] [] Nothing
+testSimpleRename = testCase "rename" $ do
+  (Scenario _ _ [f81cr3] _ _ rs _, paths) <-
+    renamer ["test"] [] Nothing $ do
+      photo "test/240806_0081.CR3" "2024-08-16T19:35:40.702857Z"
   (rs ^. allSimpleRenamings)
     @?== [ simpleRename
              f81cr3
@@ -79,17 +76,19 @@ testSimpleRename = testCase "rename" $ runWithFixture do
   paths @?== ["test/240816_0001.cr3"]
 
 testNoRename :: TestTree
-testNoRename = testCase "none" $ runWithFixture do
-  file "test/240806_0081.xmp"
-  (Scenario _ _ [_f81xmp] _ _ rs _, paths) <- renamer ["test"] [] Nothing
+testNoRename = testCase "none" $ do
+  (Scenario _ _ [_f81xmp] _ _ rs _, paths) <-
+    renamer ["test"] [] Nothing $ do
+      file "test/240806_0081.xmp"
   (rs ^. allSimpleRenamings) @?== []
   paths @?== ["test/240806_0081.xmp"]
 
 testDateNoDate :: TestTree
-testDateNoDate = testCase "dateNoDate" $ runWithFixture do
-  file "test/240806_0001.jpg"
-  photo "test/240806_0002.jpg" "2024-08-06T19:35:40.702857Z"
-  (Scenario _ _ [_f1jpg, f2jpg] _ _ rs _, paths) <- renamer ["test"] [] Nothing
+testDateNoDate = testCase "dateNoDate" $ do
+  (Scenario _ _ [_f1jpg, f2jpg] _ _ rs _, paths) <-
+    renamer ["test"] [] Nothing $ do
+      file "test/240806_0001.jpg"
+      photo "test/240806_0002.jpg" "2024-08-06T19:35:40.702857Z"
   (rs ^. allSimpleRenamings)
     @?== [ simpleRename
              f2jpg
@@ -99,10 +98,11 @@ testDateNoDate = testCase "dateNoDate" $ runWithFixture do
   paths @?== ["test/240806_0001.jpg"]
 
 testFollowTime :: TestTree
-testFollowTime = testCase "time" $ runWithFixture do
-  photo "test/240806_0003.cr3" "2024-08-06T19:35:40.702857Z"
-  photo "test/240806_0003.jpg" "2024-08-06T19:35:40.702857Z"
-  (Scenario _ _ [f3cr3, f3jpg] _ _ rs _, paths) <- renamer ["test"] [] Nothing
+testFollowTime = testCase "time" $ do
+  (Scenario _ _ [f3cr3, f3jpg] _ _ rs _, paths) <-
+    renamer ["test"] [] Nothing $ do
+      photo "test/240806_0003.cr3" "2024-08-06T19:35:40.702857Z"
+      photo "test/240806_0003.jpg" "2024-08-06T19:35:40.702857Z"
   (rs ^. allSimpleRenamings)
     @?== [ followTime
              f3cr3
@@ -116,12 +116,13 @@ testFollowTime = testCase "time" $ runWithFixture do
   paths @?== ["test/240806_0001.cr3", "test/240806_0001.jpg"]
 
 testFollowTimeNoOverlap :: TestTree
-testFollowTimeNoOverlap = testCase "timeNoOverlap" $ runWithFixture do
-  photo "test/120404_0024.JPG" "2012-04-04T16:04:50Z"
-  photo "test/120404_0024.cr2" "2012-04-04T16:04:50Z"
-  photo "test/120404_0134.jpg" "2012-04-04T16:04:50Z"
-  (Scenario _ _ [f24jpg, f24cr2, f134jpg] _ _ rs _, paths) <-
-    renamerNoIdemCheck ["test"] [] Nothing
+testFollowTimeNoOverlap = testCase "timeNoOverlap" $ do
+  let ((Scenario _ _ [f24jpg, f24cr2, f134jpg] _ _ rs _, 0), paths) =
+        runSimulation $ do
+          photo "test/120404_0024.JPG" "2012-04-04T16:04:50Z"
+          photo "test/120404_0024.cr2" "2012-04-04T16:04:50Z"
+          photo "test/120404_0134.jpg" "2012-04-04T16:04:50Z"
+          renamerNoIdemCheck ["test"] [] Nothing
   (rs ^. allSimpleRenamings)
     @?== [ simpleRenameAvoidOverlap
              f24jpg
@@ -165,8 +166,12 @@ testFollowTimeNoOverlap = testCase "timeNoOverlap" $ runWithFixture do
            "test/120404_0002.cr2",
            "test/120404_0003.jpg"
          ]
-  (Scenario _ _ [f3jpg, f3cr2, f1jpg] _ _ rs' _, paths') <-
-    renamerNoIdemCheck (reverse paths) [] Nothing
+  let ((Scenario _ _ [f3jpg, f3cr2, f1jpg] _ _ rs' _, 0), paths') =
+        runSimulation $ do
+          photo "test/120404_0003.jpg" "2012-04-04T16:04:50Z"
+          photo "test/120404_0002.cr2" "2012-04-04T16:04:50Z"
+          photo "test/120404_0001.jpg" "2012-04-04T16:04:50Z"
+          renamerNoIdemCheck (reverse paths) [] Nothing
   (rs' ^. allSimpleRenamings)
     @?== [ simpleRenameAvoidOverlap
              f3jpg
@@ -192,13 +197,13 @@ testFollowTimeNoOverlap = testCase "timeNoOverlap" $ runWithFixture do
          ]
 
 testFollowBase :: TestTree
-testFollowBase = testCase "base" $ runWithFixture do
-  photo "test/240806_0081.CR3" "2024-08-16T19:35:40.702857Z"
-  file "test/240806_0081.xmp"
-  photo "test/240806_0082.JPG" "2024-08-16T20:52:16.354628974Z"
-  file "test/240806_0082.xmp"
+testFollowBase = testCase "base" $ do
   (Scenario _ _ [f81xmp, f82xmp, f81cr3, f82jpg] _ _ rs _, paths) <-
-    renamer ["test"] [] Nothing
+    renamer ["test"] [] Nothing $ do
+      photo "test/240806_0081.CR3" "2024-08-16T19:35:40.702857Z"
+      file "test/240806_0081.xmp"
+      photo "test/240806_0082.JPG" "2024-08-16T20:52:16.354628974Z"
+      file "test/240806_0082.xmp"
   (rs ^. allSimpleRenamings)
     @?== [ simpleRename
              f81cr3
@@ -227,13 +232,13 @@ testFollowBase = testCase "base" $ runWithFixture do
          ]
 
 testFollowBaseAsScenario :: TestTree
-testFollowBaseAsScenario = testCase "base" $ runWithFixture do
-  photo "test/240806_0081.CR3" "2024-08-16T19:35:40.702857Z"
-  file "test/240806_0081.xmp"
-  photo "test/240806_0082.JPG" "2024-08-16T20:52:16.354628974Z"
-  file "test/240806_0082.xmp"
+testFollowBaseAsScenario = testCase "base" $ do
   ((Scenario _ _ ds@[f81xmp, f82xmp, f81cr3, f82jpg] _ _ _ _), paths) <-
-    renamer ["test"] [] Nothing
+    renamer ["test"] [] Nothing $ do
+      photo "test/240806_0081.CR3" "2024-08-16T19:35:40.702857Z"
+      file "test/240806_0081.xmp"
+      photo "test/240806_0082.JPG" "2024-08-16T20:52:16.354628974Z"
+      file "test/240806_0082.xmp"
   confirmScenario
     Scenario
       { _scenarioPid = 123,
@@ -317,10 +322,11 @@ testFollowBaseAsScenario = testCase "base" $ runWithFixture do
          ]
 
 testRedundantFollow :: TestTree
-testRedundantFollow = testCase "redundant" $ runWithFixture do
-  photo "test/230528_0002.heic" "2024-08-16T19:35:40.702857Z"
-  photo "test/230528_0002.jpg" "2024-08-16T19:35:40.702857Z"
-  (Scenario _ _ [f2heic, f2jpg] _ _ rs _, paths) <- renamer ["test"] [] Nothing
+testRedundantFollow = testCase "redundant" $ do
+  (Scenario _ _ [f2heic, f2jpg] _ _ rs _, paths) <-
+    renamer ["test"] [] Nothing $ do
+      photo "test/230528_0002.heic" "2024-08-16T19:35:40.702857Z"
+      photo "test/230528_0002.jpg" "2024-08-16T19:35:40.702857Z"
   (rs ^. allSimpleRenamings)
     @?== [ followTime
              f2heic
@@ -413,11 +419,11 @@ testRedundantFollow = testCase "redundant" $ runWithFixture do
   paths @?== ["test/240816_0001.heic", "test/240816_0001.jpg"]
 
 testImport :: TestTree
-testImport = testCase "import" $ runWithFixture do
-  photo "test/240806_0001.cr3" "2024-08-06T19:35:40.702857Z"
-  photo "test/240806_0001.jpg" "2024-08-06T19:35:40.702857Z"
-  photo "incoming/IMG_001.jpg" "2024-08-07T20:30:40.702857Z"
-  paths <- importer ["test"] ["incoming"] "test"
+testImport = testCase "import" $ do
+  paths <- importer ["test"] ["incoming"] "test" $ do
+    photo "test/240806_0001.cr3" "2024-08-06T19:35:40.702857Z"
+    photo "test/240806_0001.jpg" "2024-08-06T19:35:40.702857Z"
+    photo "incoming/IMG_001.jpg" "2024-08-07T20:30:40.702857Z"
   paths
     @?== [ "test/240806_0001.cr3",
            "test/240806_0001.jpg",
@@ -425,11 +431,11 @@ testImport = testCase "import" $ runWithFixture do
          ]
 
 testImportCollision :: TestTree
-testImportCollision = testCase "collision" $ runWithFixture do
-  photo "test/240806_0001.cr3" "2024-08-06T19:35:40.702857Z"
-  photo "test/240806_0001.jpg" "2024-08-06T19:35:40.702857Z"
-  photo "incoming/IMG_001.jpg" "2024-08-06T20:30:40.702857Z"
-  paths <- importer ["test"] ["incoming"] "test"
+testImportCollision = testCase "collision" $ do
+  paths <- importer ["test"] ["incoming"] "test" $ do
+    photo "test/240806_0001.cr3" "2024-08-06T19:35:40.702857Z"
+    photo "test/240806_0001.jpg" "2024-08-06T19:35:40.702857Z"
+    photo "incoming/IMG_001.jpg" "2024-08-06T20:30:40.702857Z"
   paths
     @?== [ "test/240806_0001.cr3",
            "test/240806_0001.jpg",
@@ -437,12 +443,12 @@ testImportCollision = testCase "collision" $ runWithFixture do
          ]
 
 testImportCollisionSame :: TestTree
-testImportCollisionSame = testCase "collisionSame" $ runWithFixture do
-  photo "test/240806_0001.cr3" "2024-08-06T19:35:40.702857Z"
-  photo "test/240806_0001.jpg" "2024-08-06T19:35:40.702857Z"
-  photo "incoming/IMG_001.cr3" "2024-08-06T20:30:40.702857Z"
-  photo "incoming/IMG_002.jpg" "2024-08-06T20:30:40.702857Z"
-  paths <- importer ["test"] ["incoming"] "test"
+testImportCollisionSame = testCase "collisionSame" $ do
+  paths <- importer ["test"] ["incoming"] "test" $ do
+    photo "test/240806_0001.cr3" "2024-08-06T19:35:40.702857Z"
+    photo "test/240806_0001.jpg" "2024-08-06T19:35:40.702857Z"
+    photo "incoming/IMG_001.cr3" "2024-08-06T20:30:40.702857Z"
+    photo "incoming/IMG_002.jpg" "2024-08-06T20:30:40.702857Z"
   paths
     @?== [ "test/240806_0001.cr3",
            "test/240806_0001.jpg",

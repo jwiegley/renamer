@@ -1,12 +1,34 @@
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE TupleSections #-}
 
 module Main where
 
-import Data.Time (getCurrentTime, getTimeZone)
+import Control.Lens
+import Control.Monad (when)
+import Control.Monad.IO.Class (liftIO)
+import Data.Aeson (encodeFile)
+import Data.Foldable (forM_)
+import Data.Maybe (isJust)
+import Data.Time (TimeZone, getCurrentTime, getTimeZone)
+import Fixtures (AppT, allPaths, loadDetails, runAppT, runSimulationAtPid)
 import GHC.Conc (setNumCapabilities)
 import Options.Applicative hiding (command)
 import Options.Applicative qualified as OA
-import Renamer (Command (..), Options (..), renamePhotos, runAppT)
+import Renamer
+  ( Command (..),
+    Options (..),
+    Verbosity (Normal),
+    determineScenario,
+    execute,
+    putStrLn_,
+    renamerExecute,
+    safePruneDirectory,
+    scenarioInputs,
+    scenarioPid,
+    scenarioRepository,
+    scenarioTo,
+  )
 import System.Exit (ExitCode (ExitFailure), exitSuccess, exitWith)
 
 version :: String
@@ -134,3 +156,35 @@ main = do
                   <> help "Write calculated scenario to FILE"
               )
           )
+
+renamePhotos ::
+  TimeZone ->
+  [FilePath] ->
+  [FilePath] ->
+  Maybe FilePath ->
+  AppT IO Integer
+renamePhotos tz repos inputs mdest = do
+  scenario <- determineScenario tz repos inputs mdest
+  mtoPath <- view scenarioTo
+  forM_ mtoPath $ \toPath ->
+    liftIO $ encodeFile toPath scenario
+
+  opts <- view id
+  exe <- view execute
+  if exe
+    then go scenario
+    else do
+      let (errors, paths) =
+            runSimulationAtPid (fromIntegral (scenario ^. scenarioPid)) $ do
+              loadDetails (scenario ^. scenarioRepository)
+              loadDetails (scenario ^. scenarioInputs)
+              errs <- runAppT opts $ go scenario
+              (errs,) <$> allPaths
+      forM_ paths $ putStrLn_ Normal
+      pure errors
+  where
+    go scenario = do
+      errors <- renamerExecute tz scenario
+      when (errors == 0 && isJust mdest) $
+        mapM_ safePruneDirectory inputs
+      pure errors

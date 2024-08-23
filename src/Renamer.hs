@@ -15,7 +15,7 @@ import Control.Applicative
 import Control.Concurrent.ParallelIO qualified as PIO
 import Control.Exception (assert)
 import Control.Lens hiding ((<.>))
-import Control.Monad (unless, when)
+import Control.Monad (when)
 import Control.Monad.Reader
 import Control.Monad.State
 import Control.Monad.Trans.Maybe
@@ -31,7 +31,6 @@ import Data.List.NonEmpty (NonEmpty (..))
 import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
-import Data.Maybe (isJust)
 import Data.Set (Set)
 import Data.Set qualified as S
 import Data.Time
@@ -105,7 +104,7 @@ data FileDetails = FileDetails
     _filename :: FilePath, -- "bar.CR3"
     _filebase :: FilePath, -- "bar"
     _fileext :: FilePath, -- ".CR3"
-    _fileSize :: Integer
+    _filesize :: Integer
   }
   deriving (Eq, Ord, Show, Generic)
 
@@ -505,7 +504,7 @@ instance (MonadJSON m) => MonadJSON (StateT s m) where
   encodeFile = (lift .) . encodeFile
 
 renderDetails ::
-  (MonadReader Options m, MonadLog m, MonadFail m) =>
+  (MonadReader Options m, MonadLog m) =>
   [FileDetails] ->
   m ()
 renderDetails = mapM_ $ \d ->
@@ -514,25 +513,25 @@ renderDetails = mapM_ $ \d ->
       ++ maybe "" ((" @ " ++) . show) (d ^. captureTime)
 
 getFileDetails ::
-  (Alternative m, MonadPhoto m, MonadFSRead m) =>
+  (MonadPhoto m, MonadFSRead m) =>
   FilePath ->
   m FileDetails
-getFileDetails path = do
-  isFile <- doesFileExist path
-  unless isFile $
-    error $
-      "File does not exist: " ++ path
-  let _filepath = path
-      _filedir = takeDirectory path
-      _filename = takeFileName path
-      _filebase = takeBaseName path
-      _fileext = takeExtension path
-  _captureTime <-
-    if isImage _fileext
-      then photoCaptureDate path
-      else pure Nothing
-  _fileSize <- getFileSize path
-  pure FileDetails {..}
+getFileDetails _filepath = do
+  isFile <- doesFileExist _filepath
+  if isFile
+    then do
+      _captureTime <-
+        if isImage _fileext
+          then photoCaptureDate _filepath
+          else pure Nothing
+      _filesize <- getFileSize _filepath
+      pure FileDetails {..}
+    else error $ "File does not exist: " ++ _filepath
+  where
+    _filedir = takeDirectory _filepath
+    _filename = takeFileName _filepath
+    _filebase = takeBaseName _filepath
+    _fileext = takeExtension _filepath
 
 registerFileDetails ::
   (Has e RenamerState, MonadState e m) =>
@@ -576,8 +575,7 @@ gatherDetails ::
     MonadFSRead m,
     MonadJSON m,
     MonadParallel m,
-    MonadPhoto m,
-    Alternative m
+    MonadPhoto m
   ) =>
   [FilePath] ->
   m [FileDetails]
@@ -648,7 +646,7 @@ normalizeExt ext = case strToLower ext of
   ext' -> ext'
 
 renderRenamings ::
-  (MonadReader Options m, MonadLog m, MonadFail m) =>
+  (MonadReader Options m, MonadLog m) =>
   [RenamedFile] ->
   m ()
 renderRenamings = mapM_ $ \r ->
@@ -834,7 +832,7 @@ removeOverlappedRenamings destDir rs =
                 -- where a simple sort would have chosen
                 --   A [B]-> C   B [A]-> E
                 case sortOn (^. renaming) (NE.filter k rens) of
-                  [] -> error "Unexpected in removeOverlappedRenamings"
+                  [] -> error "Unexpected: removeOverlappedRenamings"
                   y : ys -> (y, ys) : rest
         )
         []
@@ -1000,8 +998,7 @@ renderMappings ::
   ( MonadReader Options m,
     Has e RenamerState,
     MonadState e m,
-    MonadLog m,
-    MonadFail m
+    MonadLog m
   ) =>
   [Mapping] ->
   m ()
@@ -1016,7 +1013,7 @@ buildBasicPlan destDir = Prelude.map $ \ren ->
   Mapping (ren ^. sourceDetails . filepath) (target destDir ren) ren
 
 safeguardPlan ::
-  (Has e RenamerState, MonadState e m, MonadProc m, MonadLog m, MonadFail m) =>
+  (Has e RenamerState, MonadState e m, MonadProc m, MonadLog m) =>
   [Mapping] ->
   m [Mapping]
 safeguardPlan plan = do
@@ -1042,8 +1039,7 @@ buildPlan ::
     Has e RenamerState,
     MonadState e m,
     MonadProc m,
-    MonadLog m,
-    MonadFail m
+    MonadLog m
   ) =>
   Maybe FilePath ->
   [RenamedFile] ->
@@ -1097,9 +1093,7 @@ determineScenario ::
     MonadJSON m,
     MonadParallel m,
     MonadPhoto m,
-    MonadLog m,
-    MonadFail m,
-    Alternative m
+    MonadLog m
   ) =>
   TimeZone ->
   [FilePath] ->
@@ -1162,8 +1156,7 @@ safeRemoveDirectory ::
   m ()
 safeRemoveDirectory path = do
   putStrLn_ Normal $ "- " ++ path
-  dry <- not <$> view execute
-  unless dry $ removeDirectory path
+  removeDirectory path
 
 safePruneDirectory ::
   (MonadReader Options m, MonadLog m, MonadFSRead m, MonadFSWrite m) =>
@@ -1187,8 +1180,7 @@ safeRemoveFile ::
   m ()
 safeRemoveFile path = do
   -- putStrLn_ Debug $ "- " ++ path
-  dry <- not <$> view execute
-  unless dry $ removeFile path
+  removeFile path
 
 safeMoveFile ::
   ( MonadReader Options m,
@@ -1203,33 +1195,27 @@ safeMoveFile ::
 safeMoveFile label src dst
   | strToLower src == strToLower dst = do
       putStrLn_ Verbose $ src ++ " => " ++ dst
-      dry <- not <$> view execute
-      unless dry $ renameFile src dst
+      renameFile src dst
       pure 0
   | otherwise = do
       putStrLn_ Verbose $ label src dst
-      dry <- not <$> view execute
-      if dry
-        then pure 0
+      isFile <- doesFileExist dst
+      if isFile
+        then do
+          logErr' $
+            "Destination already exists, cannot copy: "
+              ++ label src dst
+          pure 1
         else do
-          isFile <- doesFileExist dst
-          if isFile
-            then do
-              logErr' $
-                "Destination already exists, cannot copy: "
-                  ++ label src dst
-              pure 1
-            else do
-              copyFileWithMetadata src dst
-              safeRemoveFile src
-              pure 0
+          copyFileWithMetadata src dst
+          safeRemoveFile src
+          pure 0
 
 executePlan ::
   ( MonadReader Options m,
     MonadLog m,
     MonadFSRead m,
-    MonadFSWrite m,
-    MonadFail m
+    MonadFSWrite m
   ) =>
   TimeZone ->
   [Mapping] ->
@@ -1244,41 +1230,21 @@ executePlan tz plan = do
   putStrLn_ Normal "Renaming complete!"
   pure $ sum results
 
-renamePhotos ::
-  ( Alternative m,
-    MonadFSRead m,
-    MonadFSWrite m,
-    MonadFail m,
-    MonadJSON m,
-    MonadLog m,
-    MonadParallel m,
-    MonadPhoto m,
-    MonadProc m,
-    MonadReader Options m,
+renamerExecute ::
+  ( MonadReader Options m,
     Has e RenamerState,
-    MonadState e m
+    MonadState e m,
+    MonadLog m,
+    MonadFSRead m,
+    MonadFSWrite m
   ) =>
   TimeZone ->
-  [FilePath] ->
-  [FilePath] ->
-  Maybe FilePath ->
+  Scenario ->
   m Integer
-renamePhotos tz repos inputs mdest = do
-  scenario <- determineScenario tz repos inputs mdest
-  mtoPath <- view scenarioTo
-  forM_ mtoPath $ encodeFile ?? scenario
+renamerExecute tz scenario = do
   errors <- use (within . errorCount)
   if errors > 0
     then do
       logErr "Cannot execute renaming plan with errors"
       pure errors
-    else do
-      errors' <- executePlan tz (scenario ^. scenarioMappings)
-      when (errors' == 0 && isJust mdest) $
-        mapM_ safePruneDirectory inputs
-      pure errors'
-
-type AppT m = ReaderT Options (StateT RenamerState m)
-
-runAppT :: (Monad m) => Options -> AppT m a -> m a
-runAppT opts k = evalStateT (runReaderT k opts) newRenamerState
+    else executePlan tz (scenario ^. scenarioMappings)

@@ -28,6 +28,8 @@ dependencies:
   - pretty-show
   - process
   - regex-tdfa
+  - tasty
+  - tasty-hunit
   - time                 >= 1.4
   - transformers         >= 0.3
   - unordered-containers >= 0.2
@@ -36,6 +38,7 @@ library:
   source-dirs: src
   exposed-modules:
     - Renamer
+    - Fixtures
 
 tests:
   renamer-tests:
@@ -44,11 +47,6 @@ tests:
     ghc-options: -fno-ignore-asserts
     dependencies:
       - HUnit
-      - hedgehog
-      - here
-      - tasty
-      - tasty-hedgehog
-      - tasty-hunit
       - renamer
 
 executables:
