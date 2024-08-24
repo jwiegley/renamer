@@ -266,9 +266,9 @@ confirmScenario Scenario {..} = do
       rds <-
         if null _scenarioRepository
           then pure []
-          else processDetails _scenarioDestination (sort _scenarioRepository)
+          else processDetails _scenarioDestination _scenarioRepository
       whenDebug $ renderDetails rds
-      ds <- processDetails _scenarioDestination (sort _scenarioInputs)
+      ds <- processDetails _scenarioDestination _scenarioInputs
       whenDebug $ renderDetails ds
       pure (rds, ds)
 

@@ -214,6 +214,7 @@ data Options = Options
     _jobs :: !Int,
     _recursive :: !Bool,
     _execute :: !Bool,
+    _caseInsensitive :: !Bool,
     _keepState :: !Bool,
     _spanDirectories :: !Bool,
     _scenarioTo :: !(Maybe FilePath),
@@ -232,6 +233,7 @@ defaultOptions =
       _jobs = 1,
       _recursive = False,
       _execute = False,
+      _caseInsensitive = False,
       _keepState = False,
       _spanDirectories = False,
       _scenarioTo = Nothing,
@@ -612,7 +614,7 @@ processDetails ::
   Maybe FilePath ->
   [FileDetails] ->
   m [FileDetails]
-processDetails = mapM . registerFileDetails
+processDetails mdest = mapM (registerFileDetails mdest) . sort
 
 {-------------------------------------------------------------------------
  - Step 5: Naming
@@ -739,7 +741,7 @@ simpleRenamings' tz = concatMap go . M.toAscList . contemporaries
           where
             work r details = Renamed details (Prefix base) r
 
-            base = yymmdd (utcToLocalTime tz tm) ++ "_"
+            base = yymmdd (utcToLocalTime tz tm)
 
 mapWithPrevM :: (Monad m) => (c -> a -> m (c, b)) -> c -> [a] -> m [b]
 mapWithPrevM f = go
@@ -767,7 +769,7 @@ applySequenceNumbers mdest = mapWithPrevM go 0
         pure (lastSeqNum, Renamed d (name n lastSeqNum) r)
       FollowBase _ -> error "Unexpected"
       where
-        name base num = base ++ printf "%04d" num <.> ext
+        name base num = base ++ "_" ++ printf "%04d" num <.> ext
         ext = normalizeExt (d ^. fileext)
 
         seqIndex spanDirs = case mdest of
@@ -1137,10 +1139,10 @@ determineScenario
             then pure []
             else
               gatherDetails _scenarioRepositories
-                >>= processDetails _scenarioDestination . sort
+                >>= processDetails _scenarioDestination
         ds <-
           gatherDetails _scenarioInputs
-            >>= processDetails _scenarioDestination . sort
+            >>= processDetails _scenarioDestination
         whenDebug $ renderDetails rds
         whenDebug $ renderDetails ds
         pure (rds, ds)

@@ -438,9 +438,9 @@ testImportCollision = testCase "collision" $ do
     photo "test/240806_0001.jpg" "2024-08-06T19:35:40.702857Z"
     photo "incoming/IMG_001.jpg" "2024-08-06T20:30:40.702857Z"
   paths
-    @?== [ "test/240806_0001+.jpg",
-           "test/240806_0001.cr3",
-           "test/240806_0001.jpg"
+    @?== [ "test/240806_0001.cr3",
+           "test/240806_0001.jpg",
+           "test/240806_0002.jpg"
          ]
 
 testImportCollisionSame :: TestTree
@@ -451,8 +451,8 @@ testImportCollisionSame = testCase "collisionSame" $ do
     photo "incoming/IMG_001.cr3" "2024-08-06T20:30:40.702857Z"
     photo "incoming/IMG_002.jpg" "2024-08-06T20:30:40.702857Z"
   paths
-    @?== [ "test/240806_0001+.cr3",
-           "test/240806_0001+.jpg",
-           "test/240806_0001.cr3",
-           "test/240806_0001.jpg"
+    @?== [ "test/240806_0001.cr3",
+           "test/240806_0001.jpg",
+           "test/240806_0002.cr3",
+           "test/240806_0002.jpg"
          ]

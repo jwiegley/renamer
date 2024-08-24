@@ -144,6 +144,10 @@ main = do
               <> help "Execute the renaming plan instead of just displaying it"
           )
         <*> switch
+          ( long "case-insensitive"
+              <> help "Enable when renaming on a case insensitive filesystem"
+          )
+        <*> switch
           ( long "keep-state"
               <> help "Keep state in .file-details.json (to aid debugging)"
           )
