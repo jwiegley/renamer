@@ -1244,7 +1244,5 @@ renamerExecute ::
 renamerExecute tz scenario = do
   errors <- use (within . errorCount)
   if errors > 0
-    then do
-      logErr "Cannot execute renaming plan with errors"
-      pure errors
+    then errors <$ logErr "Cannot execute renaming plan with errors"
     else executePlan tz (scenario ^. scenarioMappings)

@@ -15,21 +15,9 @@ import Fixtures (AppT, allPaths, loadDetails, runAppT, runSimulationAtPid)
 import GHC.Conc (setNumCapabilities)
 import Options.Applicative hiding (command)
 import Options.Applicative qualified as OA
-import Renamer
-  ( Command (..),
-    Options (..),
-    Verbosity (Normal),
-    determineScenario,
-    execute,
-    putStrLn_,
-    renamerExecute,
-    safePruneDirectory,
-    scenarioInputs,
-    scenarioPid,
-    scenarioRepository,
-    scenarioTo,
-  )
+import Renamer (Command (..), Options (..), Verbosity (Normal), determineScenario, execute, putStrLn_, renamerExecute, safePruneDirectory, scenarioInputs, scenarioMappings, scenarioPid, scenarioRepository, scenarioTo)
 import System.Exit (ExitCode (ExitFailure), exitSuccess, exitWith)
+import System.IO (hFlush, stdout)
 
 version :: String
 version = "0.0.1"
@@ -174,12 +162,15 @@ renamePhotos tz repos inputs mdest = do
   if exe
     then go scenario
     else do
+      liftIO $ hFlush stdout
       let (errors, paths) =
             runSimulationAtPid (fromIntegral (scenario ^. scenarioPid)) $ do
               loadDetails (scenario ^. scenarioRepository)
               loadDetails (scenario ^. scenarioInputs)
               errs <- runAppT opts $ go scenario
               (errs,) <$> allPaths
+      liftIO $ hFlush stdout
+      putStrLn_ Normal "Resulting pathnames would be:"
       forM_ paths $ putStrLn_ Normal
       pure errors
   where
