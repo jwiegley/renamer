@@ -8,6 +8,7 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE ViewPatterns #-}
 
 module Renamer where
 
@@ -34,6 +35,7 @@ import Data.Map.Strict qualified as M
 import Data.Set qualified as S
 import Data.Time
 import Data.Traversable (forM)
+import Debug.Trace (traceM)
 import GHC.Generics (Generic)
 import System.Directory qualified as Dir
 import System.Exit
@@ -43,6 +45,7 @@ import System.Process qualified as Proc
 import Text.Printf
 import Text.Regex.TDFA
 import Text.Regex.TDFA.String ()
+import Text.Show.Pretty (ppShow)
 import Prelude hiding (putStrLn)
 import Prelude qualified as Pre (putStrLn)
 
@@ -119,8 +122,7 @@ type DetailsMap = HashMap FilePath FileDetails
 -- These are listed in order of priority, when multiple conflicting renamings
 -- are found.
 data Renaming
-  = SimpleRenameAvoidOverlap UTCTime
-  | SimpleRename UTCTime
+  = SimpleRename UTCTime
   | FollowBase FilePath
   | FollowTime FilePath
   deriving (Eq, Ord, Show, Generic)
@@ -132,28 +134,31 @@ instance ToJSON Renaming where
 
 instance FromJSON Renaming
 
-data RenamedFile = RenamedFile
+data Renamed a = Renamed
   { _sourceDetails :: FileDetails,
-    _renamedFile :: FilePath,
+    _renamedTo :: a,
     _renaming :: Renaming
   }
   deriving (Eq, Show, Generic)
 
-makeLenses ''RenamedFile
+makeLenses ''Renamed
 
-instance ToJSON RenamedFile where
+instance (ToJSON a) => ToJSON (Renamed a) where
   toEncoding = genericToEncoding JSON.defaultOptions
 
-instance FromJSON RenamedFile
+instance (FromJSON a) => FromJSON (Renamed a)
 
-source :: Lens' RenamedFile FilePath
-source = sourceDetails . filepath
+newtype Prefix = Prefix {getPrefix :: FilePath}
+  deriving (Eq, Ord, Show, Generic)
 
-target :: Maybe FilePath -> RenamedFile -> FilePath
-target destDir r =
+sourcePath :: Lens' (Renamed a) FilePath
+sourcePath = sourceDetails . filepath
+
+targetPath :: Maybe FilePath -> Renamed FilePath -> FilePath
+targetPath destDir r =
   case destDir of
-    Just d -> d </> r ^. renamedFile
-    Nothing -> r ^. sourceDetails . filedir </> r ^. renamedFile
+    Just d -> d </> r ^. renamedTo
+    Nothing -> r ^. sourceDetails . filedir </> r ^. renamedTo
 
 -- | State of the image repository (new or old).
 data RenamerState = RenamerState
@@ -385,32 +390,12 @@ instance MonadPhoto IO where
     runMaybeT $
       exiftoolSubSecDateTimeOriginal path
         <|> exiftoolDateTimeOriginal path
-        <|> exiv2ImageTimestamp path
 
 instance (MonadPhoto m) => MonadPhoto (ReaderT e m) where
   photoCaptureDate = lift . photoCaptureDate
 
 instance (MonadPhoto m) => MonadPhoto (StateT s m) where
   photoCaptureDate = lift . photoCaptureDate
-
-exiv2ImageTimestamp :: FilePath -> MaybeT IO UTCTime
-exiv2ImageTimestamp path = do
-  (ec, out, _err) <-
-    liftIO $
-      readProcessWithExitCode
-        "exiv2"
-        ["-g", "Exif.Image.DateTime", "-Pv", path]
-        ""
-  MaybeT $
-    pure $
-      case ec of
-        ExitSuccess ->
-          parseTimeM
-            False
-            defaultTimeLocale
-            "%0Y:%0m:%0d %0H:%0M:%0S\n"
-            out
-        ExitFailure _code -> Nothing
 
 exiftoolSubSecDateTimeOriginal :: FilePath -> MaybeT IO UTCTime
 exiftoolSubSecDateTimeOriginal path = do
@@ -656,7 +641,7 @@ normalizeExt ext = case strToLower ext of
 
 renderRenamings ::
   (MonadReader Options m, MonadLog m) =>
-  [RenamedFile] ->
+  [Renamed a] ->
   m ()
 renderRenamings = mapM_ $ \r ->
   putStrLn_ Debug $
@@ -673,7 +658,7 @@ hasUniqueExts =
 --   association can happen either due to both files having the same
 --   timestamp, or the same basename (which is needed for files that have no
 --   capture timestamp, like XMP).
-siblingRenamings :: [FileDetails] -> [RenamedFile] -> [RenamedFile]
+siblingRenamings :: [FileDetails] -> [Renamed FilePath] -> [Renamed FilePath]
 siblingRenamings xs = concatMap go
   where
     siblings :: HashMap (FilePath, FilePath) [FileDetails]
@@ -683,7 +668,7 @@ siblingRenamings xs = concatMap go
         mempty
         xs
 
-    go (RenamedFile details newname _ren) =
+    go (Renamed details newname _ren) =
       case siblings
         ^? ix (details ^. filedir, details ^. filebase)
           . to (partition (\y -> y ^. fileext == details ^. fileext)) of
@@ -699,7 +684,7 @@ siblingRenamings xs = concatMap go
                 zs ->
               Prelude.map
                 ( \z ->
-                    RenamedFile
+                    Renamed
                       z
                       (name z)
                       (FollowBase (details ^. filepath))
@@ -722,14 +707,11 @@ siblingRenamings xs = concatMap go
 --   Note that this function aims to be very simple, and so does not perform
 --   every possible optimization, such as removing needless renamings that
 --   would be idempotent.
-simpleRenamings ::
-  (MonadReader Options m, Has e RenamerState, MonadState e m) =>
+simpleRenamings' ::
   TimeZone ->
-  Maybe FilePath ->
   [FileDetails] ->
-  m [RenamedFile]
-simpleRenamings tz mdest =
-  fmap reverse . foldrM go [] . M.toDescList . contemporaries
+  [Renamed Prefix]
+simpleRenamings' tz = concatMap go . M.toAscList . contemporaries
   where
     contemporaries ::
       [FileDetails] -> Map (FilePath, UTCTime) [FileDetails]
@@ -743,84 +725,115 @@ simpleRenamings tz mdest =
         )
         mempty
 
-    go ((_dir, tm), entries) rest = do
-      entries' <-
-        if hasUniqueExts entries
-          then rename (SimpleRename tm) entries
-          else
-            concatMapM
-              (rename (SimpleRenameAvoidOverlap tm) . (: []))
-              entries
-      pure $ entries' ++ rest
+    go ((_dir, tm), reverse -> entries) = entries'
       where
-        rename _ [] = pure []
-        rename ren (e : es) = do
-          base <- expectedBase
-          pure $
-            work ren base e []
-              ++ foldr (work (FollowTime (e ^. filename)) base) [] es
+        entries'
+          | hasUniqueExts entries = rename (SimpleRename tm) entries
+          | otherwise =
+              concatMap (rename (SimpleRename tm) . (: [])) entries
+
+        rename _ [] = []
+        rename ren (e : es) =
+          work ren e
+            : Prelude.map (work (FollowTime (e ^. filename))) es
           where
-            work r base details =
-              (RenamedFile details (name details) r :)
-              where
-                name d = base <.> ext d
-                ext d = normalizeExt (d ^. fileext)
+            work r details = Renamed details (Prefix base) r
 
-            expectedBase = do
-              spanDirs <- view spanDirectories
-              newName (yymmdd tm')
-                <$> nextSeqNum (seqIndex spanDirs (yymmdd tm'))
-              where
-                seqIndex spanDirs = case mdest of
-                  Nothing
-                    | spanDirs -> id
-                    | otherwise -> (e ^. filedir </>)
-                  Just destDir -> (destDir </>)
+            base = yymmdd (utcToLocalTime tz tm) ++ "_"
 
-                tm' = utcToLocalTime tz tm
-                newName base seqNum = base ++ "_" ++ printf "%04d" seqNum
+mapWithPrevM :: (Monad m) => (c -> a -> m (c, b)) -> c -> [a] -> m [b]
+mapWithPrevM f = go
+  where
+    go _ [] = pure []
+    go z (x : xs) = do
+      (c, y) <- f z x
+      (y :) <$> go c xs
+
+applySequenceNumbers ::
+  (MonadReader Options m, Has e RenamerState, MonadState e m) =>
+  Maybe FilePath ->
+  [Renamed Prefix] ->
+  m [Renamed FilePath]
+applySequenceNumbers mdest = mapWithPrevM go 0
+  where
+    go lastSeqNum (Renamed d (Prefix n) r) = case r of
+      SimpleRename _ -> do
+        spanDirs <- view spanDirectories
+        num <- nextSeqNum (seqIndex spanDirs n)
+        pure (num, Renamed d (name n num) r)
+      FollowTime _ ->
+        -- jww (2024-08-24): lookup name in a mapping from names to seqnums,
+        -- rather than depending on the order.
+        pure (lastSeqNum, Renamed d (name n lastSeqNum) r)
+      FollowBase _ -> error "Unexpected"
+      where
+        name base num = base ++ printf "%04d" num <.> ext
+        ext = normalizeExt (d ^. fileext)
+
+        seqIndex spanDirs = case mdest of
+          Nothing
+            | spanDirs -> id
+            | otherwise -> (d ^. filedir </>)
+          Just destDir -> (destDir </>)
+
+simpleRenamings ::
+  (MonadReader Options m, Has e RenamerState, MonadState e m) =>
+  TimeZone ->
+  Maybe FilePath ->
+  [FileDetails] ->
+  m [Renamed FilePath]
+simpleRenamings tz mdest = applySequenceNumbers mdest . simpleRenamings' tz
 
 -- | Entries that would rename a file to itself.
-idempotentRenaming :: Maybe FilePath -> RenamedFile -> Bool
-idempotentRenaming destDir ren = ren ^. source == target destDir ren
+idempotentRenaming :: Maybe FilePath -> Renamed FilePath -> Bool
+idempotentRenaming destDir ren =
+  ren ^. sourcePath == targetPath destDir ren
 
 reportIdempotentRenamings ::
   (MonadReader Options m, Has e RenamerState, MonadState e m, MonadLog m) =>
   Maybe FilePath ->
-  [RenamedFile] ->
+  [Renamed FilePath] ->
   m ()
 reportIdempotentRenamings destDir rs =
   forM_ (filter (idempotentRenaming destDir) rs) $ \ren ->
     logErr $
       "Renaming file to itself: " ++ show ren
 
-redundantRenaming :: Maybe FilePath -> RenamedFile -> RenamedFile -> Bool
+redundantRenaming ::
+  Maybe FilePath ->
+  Renamed FilePath ->
+  Renamed FilePath ->
+  Bool
 redundantRenaming destDir rx ry =
-  rx ^. source == ry ^. source && target destDir rx == target destDir ry
+  rx ^. sourcePath == ry ^. sourcePath
+    && targetPath destDir rx == targetPath destDir ry
 
 removeRedundantRenamings ::
-  (RenamedFile -> FilePath) -> Maybe FilePath -> [RenamedFile] -> [RenamedFile]
+  (Renamed FilePath -> FilePath) ->
+  Maybe FilePath ->
+  [Renamed FilePath] ->
+  [Renamed FilePath]
 removeRedundantRenamings f destDir =
   -- Prelude.map NE.head . sortAndGroupOn f
   Prelude.map NE.head . NE.groupBy (redundantRenaming destDir) . sortOn f
 
 groupRenamingsBy ::
-  (RenamedFile -> FilePath) ->
-  [RenamedFile] ->
-  [NonEmpty RenamedFile]
+  (Renamed FilePath -> FilePath) ->
+  [Renamed FilePath] ->
+  [NonEmpty (Renamed FilePath)]
 groupRenamingsBy f = filter (\xs -> NE.length xs > 1) . sortAndGroupOn f
 
 removeOverlappedRenamings ::
   Maybe FilePath ->
-  [RenamedFile] ->
-  ([RenamedFile], [(RenamedFile, NonEmpty RenamedFile)])
+  [Renamed FilePath] ->
+  ([Renamed FilePath], [(Renamed FilePath, NonEmpty (Renamed FilePath))])
 removeOverlappedRenamings destDir rs =
   ( Prelude.map fst rs'',
     onlyOverlaps rs' ++ onlyOverlaps rs''
   )
   where
-    rs' = nonOverlapped (^. source) rs
-    rs'' = nonOverlapped (target destDir) (Prelude.map fst rs')
+    rs' = nonOverlapped (^. sourcePath) rs
+    rs'' = nonOverlapped (targetPath destDir) (Prelude.map fst rs')
 
     nonOverlapped f =
       foldr
@@ -854,37 +867,36 @@ removeOverlappedRenamings destDir rs =
 reportOverlappedSources ::
   (MonadReader Options m, Has e RenamerState, MonadState e m, MonadLog m) =>
   Maybe FilePath ->
-  [RenamedFile] ->
+  [Renamed FilePath] ->
   m ()
 reportOverlappedSources destDir rs =
-  forM_ (groupRenamingsBy (^. source) rs) $ \dsts ->
+  forM_ (groupRenamingsBy (^. sourcePath) rs) $ \dsts ->
     forM_ dsts $ \dst ->
       logErr $
         "Overlapped source: "
-          ++ dst ^. source
+          ++ dst ^. sourcePath
           ++ " -> "
-          ++ target destDir dst
+          ++ targetPath destDir dst
 
 reportOverlappedTargets ::
   (MonadReader Options m, Has e RenamerState, MonadState e m, MonadLog m) =>
   Maybe FilePath ->
-  [RenamedFile] ->
+  [Renamed FilePath] ->
   m ()
 reportOverlappedTargets destDir rs =
-  forM_ (groupRenamingsBy (target destDir) rs) $ \srcs ->
+  forM_ (groupRenamingsBy (targetPath destDir) rs) $ \srcs ->
     forM_ srcs $ \src ->
       logErr $
         "Overlapped target: "
-          ++ src ^. source
+          ++ src ^. sourcePath
           ++ " -> "
-          ++ target destDir src
+          ++ targetPath destDir src
 
-renamingLabel :: TimeZone -> RenamedFile -> FilePath -> FilePath -> String
+renamingLabel :: TimeZone -> Renamed FilePath -> FilePath -> FilePath -> String
 renamingLabel tz ren srcPath dstPath =
   srcPath
     ++ case ren ^. renaming of
       SimpleRename tm -> " (" ++ formattedTime tm ++ ")-> "
-      SimpleRenameAvoidOverlap tm -> " (" ++ formattedTime tm ++ ")!> "
       FollowBase name -> " [" ++ name ++ "]-> "
       FollowTime name -> " {" ++ name ++ "}-> "
     ++ dstPath
@@ -895,12 +907,12 @@ renamingLabel tz ren srcPath dstPath =
         tm' = utcToLocalTime tz tm
 
 data RenamingSet = RenamingSet
-  { _allSimpleRenamings :: [RenamedFile],
-    _allSiblingRenamings :: [RenamedFile],
-    _allRenamingsWithoutRedundancies :: [RenamedFile],
+  { _allSimpleRenamings :: [Renamed FilePath],
+    _allSiblingRenamings :: [Renamed FilePath],
+    _allRenamingsWithoutRedundancies :: [Renamed FilePath],
     -- | All remainings includes both simple and sibling renamings, and is
     --   clear of idempotent, redundant and overlapped renamings.
-    _allRenamings :: [RenamedFile]
+    _allRenamings :: [Renamed FilePath]
   }
   deriving (Eq, Show, Generic)
 
@@ -947,23 +959,13 @@ renameFiles tz destDir ds = do
       rs3 = rs1' ++ rs2
   assert
     ( Prelude.all
-        ( \g ->
-            length
-              ( NE.filter
-                  ( \x ->
-                      has (renaming . _SimpleRenameAvoidOverlap) x
-                        || has (renaming . _SimpleRename) x
-                  )
-                  g
-              )
-              < 2
-        )
-        (groupRenamingsBy (^. source) rs3)
+        (\g -> length (NE.filter (has (renaming . _SimpleRename)) g) < 2)
+        (groupRenamingsBy (^. sourcePath) rs3)
     )
     $ do
       let rs4 =
-            removeRedundantRenamings (target destDir) destDir $
-              removeRedundantRenamings (^. source) destDir $
+            removeRedundantRenamings (targetPath destDir) destDir $
+              removeRedundantRenamings (^. sourcePath) destDir $
                 filter (not . idempotentRenaming destDir) $
                   rs3
           (rs5, overlaps) = removeOverlappedRenamings destDir rs4
@@ -971,12 +973,12 @@ renameFiles tz destDir ds = do
         putStrLn_ Normal $ "Preferring this renaming:"
         putStrLn_ Normal $
           "    "
-            ++ renamingLabel tz x (x ^. source) (target destDir x)
+            ++ renamingLabel tz x (x ^. sourcePath) (targetPath destDir x)
         putStrLn_ Normal $ "  over these:"
         forM_ ys $ \y ->
           putStrLn_ Normal $
             "    "
-              ++ renamingLabel tz y (y ^. source) (target destDir y)
+              ++ renamingLabel tz y (y ^. sourcePath) (targetPath destDir y)
       pure $ RenamingSet rs1 rs2 rs4 rs5
 
 {-------------------------------------------------------------------------
@@ -986,7 +988,7 @@ renameFiles tz destDir ds = do
 data Mapping = Mapping
   { _sourceFile :: FilePath,
     _targetFile :: FilePath,
-    _renamingRef :: RenamedFile
+    _renamingRef :: Renamed FilePath
   }
   deriving (Eq, Show, Generic)
 
@@ -1010,10 +1012,10 @@ renderMappings = mapM_ $ \(Mapping src dst _) ->
 
 buildBasicPlan ::
   Maybe FilePath ->
-  [RenamedFile] ->
+  [Renamed FilePath] ->
   [Mapping]
 buildBasicPlan destDir = Prelude.map $ \ren ->
-  Mapping (ren ^. sourceDetails . filepath) (target destDir ren) ren
+  Mapping (ren ^. sourcePath) (targetPath destDir ren) ren
 
 safeguardPlan ::
   (Has e RenamerState, MonadState e m, MonadProc m, MonadLog m) =>
@@ -1053,7 +1055,7 @@ buildPlan ::
     MonadLog m
   ) =>
   Maybe FilePath ->
-  [RenamedFile] ->
+  [Renamed FilePath] ->
   m [Mapping]
 buildPlan destDir rs = do
   reportIdempotentRenamings destDir rs

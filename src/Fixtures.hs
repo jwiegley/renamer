@@ -199,18 +199,14 @@ file path =
       path
       (const (Just (FileEntry Nothing 100)))
 
-simpleRename :: FileDetails -> String -> String -> RenamedFile
-simpleRename details name tm = RenamedFile details name (SimpleRename (time tm))
+simpleRename :: FileDetails -> String -> String -> Renamed FilePath
+simpleRename details name tm = Renamed details name (SimpleRename (time tm))
 
-simpleRenameAvoidOverlap :: FileDetails -> String -> String -> RenamedFile
-simpleRenameAvoidOverlap details name tm =
-  RenamedFile details name (SimpleRenameAvoidOverlap (time tm))
+followBase :: FileDetails -> String -> String -> Renamed FilePath
+followBase details name n = Renamed details name (FollowBase n)
 
-followBase :: FileDetails -> String -> String -> RenamedFile
-followBase details name n = RenamedFile details name (FollowBase n)
-
-followTime :: FileDetails -> String -> String -> RenamedFile
-followTime details name n = RenamedFile details name (FollowTime n)
+followTime :: FileDetails -> String -> String -> Renamed FilePath
+followTime details name n = Renamed details name (FollowTime n)
 
 ls :: Simulation ()
 ls = do

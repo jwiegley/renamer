@@ -105,14 +105,14 @@ testFollowTime = testCase "time" $ do
       photo "test/240806_0003.cr3" "2024-08-06T19:35:40.702857Z"
       photo "test/240806_0003.jpg" "2024-08-06T19:35:40.702857Z"
   (rs ^. allSimpleRenamings)
-    @?== [ followTime
+    @?== [ simpleRename
              f3cr3
              "240806_0001.cr3"
-             "240806_0003.jpg",
-           simpleRename
+             "2024-08-06T19:35:40.702857Z",
+           followTime
              f3jpg
              "240806_0001.jpg"
-             "2024-08-06T19:35:40.702857Z"
+             "240806_0003.cr3"
          ]
   paths @?== ["test/240806_0001.cr3", "test/240806_0001.jpg"]
 
@@ -125,40 +125,40 @@ testFollowTimeNoOverlap = testCase "timeNoOverlap" $ do
           photo "test/120404_0134.jpg" "2012-04-04T16:04:50Z"
           renamerNoIdemCheck ["test"] [] Nothing
   (rs ^. allSimpleRenamings)
-    @?== [ simpleRenameAvoidOverlap
+    @?== [ simpleRename
              f24jpg
-             "120404_0003.jpg"
+             "120404_0001.jpg"
              "2012-04-04T16:04:50Z",
-           simpleRenameAvoidOverlap
+           simpleRename
              f24cr2
              "120404_0002.cr2"
              "2012-04-04T16:04:50Z",
-           simpleRenameAvoidOverlap
+           simpleRename
              f134jpg
-             "120404_0001.jpg"
+             "120404_0003.jpg"
              "2012-04-04T16:04:50Z"
          ]
   groupRenamingsBy
-    (^. source)
+    (^. sourcePath)
     ( rs ^. allSimpleRenamings
         ++ rs ^. allSiblingRenamings
     )
-    @?== [ simpleRenameAvoidOverlap
+    @?== [ simpleRename
              f24jpg
-             "120404_0003.jpg"
+             "120404_0001.jpg"
              "2012-04-04T16:04:50Z"
              :| [ followBase
                     f24jpg
                     "120404_0002.jpg"
                     "test/120404_0024.cr2"
                 ],
-           simpleRenameAvoidOverlap
+           simpleRename
              f24cr2
              "120404_0002.cr2"
              "2012-04-04T16:04:50Z"
              :| [ followBase
                     f24cr2
-                    "120404_0003.cr2"
+                    "120404_0001.cr2"
                     "test/120404_0024.JPG"
                 ]
          ]
@@ -167,28 +167,28 @@ testFollowTimeNoOverlap = testCase "timeNoOverlap" $ do
            "test/120404_0002.cr2",
            "test/120404_0003.jpg"
          ]
-  let ((Scenario _ _ [f3jpg, f3cr2, f1jpg] _ _ rs' _, 0), paths') =
+  let ((Scenario _ _ [f1jpg, f2cr2, f3jpg] _ _ rs' _, 0), paths') =
         runSimulation $ do
           photo "test/120404_0003.jpg" "2012-04-04T16:04:50Z"
           photo "test/120404_0002.cr2" "2012-04-04T16:04:50Z"
           photo "test/120404_0001.jpg" "2012-04-04T16:04:50Z"
           renamerNoIdemCheck (reverse paths) [] Nothing
   (rs' ^. allSimpleRenamings)
-    @?== [ simpleRenameAvoidOverlap
-             f3jpg
-             "120404_0003.jpg"
-             "2012-04-04T16:04:50Z",
-           simpleRenameAvoidOverlap
-             f3cr2
-             "120404_0002.cr2"
-             "2012-04-04T16:04:50Z",
-           simpleRenameAvoidOverlap
+    @?== [ simpleRename
              f1jpg
              "120404_0001.jpg"
+             "2012-04-04T16:04:50Z",
+           simpleRename
+             f2cr2
+             "120404_0002.cr2"
+             "2012-04-04T16:04:50Z",
+           simpleRename
+             f3jpg
+             "120404_0003.jpg"
              "2012-04-04T16:04:50Z"
          ]
   groupRenamingsBy
-    (^. source)
+    (^. sourcePath)
     (rs' ^. allSimpleRenamings ++ rs' ^. allSiblingRenamings)
     @?== []
   paths'
@@ -221,9 +221,9 @@ testFollowBase = testCase "base" $ do
          ]
   filter (idempotentRenaming Nothing) (rs ^. allRenamingsWithoutRedundancies)
     @?== []
-  groupRenamingsBy (^. source) (rs ^. allRenamingsWithoutRedundancies)
+  groupRenamingsBy (^. sourcePath) (rs ^. allRenamingsWithoutRedundancies)
     @?== []
-  groupRenamingsBy (target Nothing) (rs ^. allRenamingsWithoutRedundancies)
+  groupRenamingsBy (targetPath Nothing) (rs ^. allRenamingsWithoutRedundancies)
     @?== []
   paths
     @?== [ "test/240816_0001.cr3",
@@ -329,14 +329,14 @@ testRedundantFollow = testCase "redundant" $ do
       photo "test/230528_0002.heic" "2024-08-16T19:35:40.702857Z"
       photo "test/230528_0002.jpg" "2024-08-16T19:35:40.702857Z"
   (rs ^. allSimpleRenamings)
-    @?== [ followTime
+    @?== [ simpleRename
              f2heic
              "240816_0001.heic"
-             "230528_0002.jpg",
-           simpleRename
+             "2024-08-16T19:35:40.702857Z",
+           followTime
              f2jpg
              "240816_0001.jpg"
-             "2024-08-16T19:35:40.702857Z"
+             "230528_0002.heic"
          ]
   (rs ^. allSiblingRenamings)
     @?== [ followBase f2jpg "240816_0001.jpg" "test/230528_0002.heic",
@@ -347,21 +347,21 @@ testRedundantFollow = testCase "redundant" $ do
     (rs ^. allRenamingsWithoutRedundancies)
     @?== []
   groupRenamingsBy
-    (^. source)
+    (^. sourcePath)
     (rs ^. allSimpleRenamings ++ rs ^. allSiblingRenamings)
-    @?== [ followTime
+    @?== [ simpleRename
              f2heic
              "240816_0001.heic"
-             "230528_0002.jpg"
+             "2024-08-16T19:35:40.702857Z"
              :| [ followBase
                     f2heic
                     "240816_0001.heic"
                     "test/230528_0002.jpg"
                 ],
-           simpleRename
+           followTime
              f2jpg
              "240816_0001.jpg"
-             "2024-08-16T19:35:40.702857Z"
+             "230528_0002.heic"
              :| [ followBase
                     f2jpg
                     "240816_0001.jpg"
@@ -369,34 +369,34 @@ testRedundantFollow = testCase "redundant" $ do
                 ]
          ]
   removeRedundantRenamings
-    (^. source)
+    (^. sourcePath)
     Nothing
     (rs ^. allSimpleRenamings ++ rs ^. allSiblingRenamings)
-    @?== [ followTime
+    @?== [ simpleRename
              f2heic
              "240816_0001.heic"
-             "230528_0002.jpg",
-           simpleRename
+             "2024-08-16T19:35:40.702857Z",
+           followTime
              f2jpg
              "240816_0001.jpg"
-             "2024-08-16T19:35:40.702857Z"
+             "230528_0002.heic"
          ]
   groupRenamingsBy
-    (target Nothing)
+    (targetPath Nothing)
     (rs ^. allSimpleRenamings ++ rs ^. allSiblingRenamings)
-    @?== [ followTime
+    @?== [ simpleRename
              f2heic
              "240816_0001.heic"
-             "230528_0002.jpg"
+             "2024-08-16T19:35:40.702857Z"
              :| [ followBase
                     f2heic
                     "240816_0001.heic"
                     "test/230528_0002.jpg"
                 ],
-           simpleRename
+           followTime
              f2jpg
              "240816_0001.jpg"
-             "2024-08-16T19:35:40.702857Z"
+             "230528_0002.heic"
              :| [ followBase
                     f2jpg
                     "240816_0001.jpg"
@@ -404,17 +404,17 @@ testRedundantFollow = testCase "redundant" $ do
                 ]
          ]
   removeRedundantRenamings
-    (target Nothing)
+    (targetPath Nothing)
     Nothing
     (rs ^. allSimpleRenamings ++ rs ^. allSiblingRenamings)
-    @?== [ followTime
+    @?== [ simpleRename
              f2heic
              "240816_0001.heic"
-             "230528_0002.jpg",
-           simpleRename
+             "2024-08-16T19:35:40.702857Z",
+           followTime
              f2jpg
              "240816_0001.jpg"
-             "2024-08-16T19:35:40.702857Z"
+             "230528_0002.heic"
          ]
   -- Due to the overlapped sources and targets, no renaming was able to occur.
   paths @?== ["test/240816_0001.heic", "test/240816_0001.jpg"]
@@ -438,9 +438,9 @@ testImportCollision = testCase "collision" $ do
     photo "test/240806_0001.jpg" "2024-08-06T19:35:40.702857Z"
     photo "incoming/IMG_001.jpg" "2024-08-06T20:30:40.702857Z"
   paths
-    @?== [ "test/240806_0001.cr3",
-           "test/240806_0001.jpg",
-           "test/240806_0002.jpg"
+    @?== [ "test/240806_0001+.jpg",
+           "test/240806_0001.cr3",
+           "test/240806_0001.jpg"
          ]
 
 testImportCollisionSame :: TestTree
@@ -451,8 +451,8 @@ testImportCollisionSame = testCase "collisionSame" $ do
     photo "incoming/IMG_001.cr3" "2024-08-06T20:30:40.702857Z"
     photo "incoming/IMG_002.jpg" "2024-08-06T20:30:40.702857Z"
   paths
-    @?== [ "test/240806_0001.cr3",
-           "test/240806_0001.jpg",
-           "test/240806_0002.cr3",
-           "test/240806_0002.jpg"
+    @?== [ "test/240806_0001+.cr3",
+           "test/240806_0001+.jpg",
+           "test/240806_0001.cr3",
+           "test/240806_0001.jpg"
          ]
