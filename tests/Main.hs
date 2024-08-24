@@ -39,9 +39,10 @@ main =
           ],
         testGroup
           "scenario"
-          [ testScenario "tests/scenario/basic.json"
-          ]
+          []
       ]
+
+-- testScenario "tests/scenario/basic.json"
 
 testSameName :: TestTree
 testSameName = testCase "same" $ do

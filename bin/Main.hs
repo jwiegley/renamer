@@ -1,5 +1,6 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TupleSections #-}
 
 module Main where
@@ -7,7 +8,6 @@ module Main where
 import Control.Lens
 import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (encodeFile)
 import Data.Foldable (forM_)
 import Data.Maybe (isJust)
 import Data.Time (TimeZone, getCurrentTime, getTimeZone)
@@ -17,11 +17,13 @@ import Options.Applicative hiding (command)
 import Options.Applicative qualified as OA
 import Renamer
   ( Command (..),
+    MonadJSON (..),
     Options (..),
     determineScenario,
     execute,
     renamerExecute,
     safePruneDirectory,
+    scenarioFrom,
     scenarioInputs,
     scenarioPid,
     scenarioRepository,
@@ -155,6 +157,12 @@ main = do
                   <> help "Write calculated scenario to FILE"
               )
           )
+        <*> optional
+          ( strOption
+              ( long "read-scenario"
+                  <> help "Read previously calculated scenario from FILE"
+              )
+          )
 
 renamePhotos ::
   Options ->
@@ -165,7 +173,14 @@ renamePhotos ::
   IO Integer
 renamePhotos opts tz repos inputs mdest = do
   (scenario, errors) <- runAppT opts $ do
-    s <- determineScenario tz repos inputs mdest
+    s <-
+      view scenarioFrom >>= \case
+        Just fromPath -> do
+          mres <- liftIO $ decodeFileStrict fromPath
+          case mres of
+            Just s -> pure s
+            Nothing -> error $ "Failed to read scenario from " ++ fromPath
+        Nothing -> determineScenario tz repos inputs mdest
     mtoPath <- view scenarioTo
     forM_ mtoPath $ \toPath ->
       liftIO $ encodeFile toPath s

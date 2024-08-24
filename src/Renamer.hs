@@ -31,7 +31,6 @@ import Data.List.NonEmpty (NonEmpty (..))
 import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
-import Data.Set (Set)
 import Data.Set qualified as S
 import Data.Time
 import Data.Traversable (forM)
@@ -212,7 +211,8 @@ data Options = Options
     _execute :: !Bool,
     _keepState :: !Bool,
     _spanDirectories :: !Bool,
-    _scenarioTo :: !(Maybe FilePath)
+    _scenarioTo :: !(Maybe FilePath),
+    _scenarioFrom :: !(Maybe FilePath)
   }
   deriving (Show, Eq)
 
@@ -229,7 +229,8 @@ defaultOptions =
       _execute = False,
       _keepState = False,
       _spanDirectories = False,
-      _scenarioTo = Nothing
+      _scenarioTo = Nothing,
+      _scenarioFrom = Nothing
     }
 
 class (Monad m) => MonadLog m where
@@ -280,6 +281,14 @@ logErr ::
 logErr msg = do
   putStrLn_ Error $ "ERROR: " ++ msg
   within . errorCount += 1
+
+logWarn ::
+  ( MonadReader Options m,
+    MonadLog m
+  ) =>
+  String ->
+  m ()
+logWarn msg = putStrLn_ Normal $ "WARNING: " ++ msg
 
 logErr' ::
   ( MonadReader Options m,
@@ -745,14 +754,14 @@ simpleRenamings tz mdest =
       pure $ entries' ++ rest
       where
         rename _ [] = pure []
-        rename f (e : es) = do
+        rename ren (e : es) = do
           base <- expectedBase
           pure $
-            work f base e []
+            work ren base e []
               ++ foldr (work (FollowTime (e ^. filename)) base) [] es
           where
-            work ren base details =
-              (RenamedFile details (name details) ren :)
+            work r base details =
+              (RenamedFile details (name details) r :)
               where
                 name d = base <.> ext d
                 ext d = normalizeExt (d ^. fileext)
@@ -988,12 +997,6 @@ instance ToJSON Mapping where
 
 instance FromJSON Mapping
 
-mappingSets :: [Mapping] -> (Set FilePath, Set FilePath)
-mappingSets = foldl' go (mempty, mempty)
-  where
-    go (srcSet, dstSet) (Mapping src dst _) =
-      (srcSet & at src ?~ (), dstSet & at dst ?~ ())
-
 renderMappings ::
   ( MonadReader Options m,
     Has e RenamerState,
@@ -1018,10 +1021,10 @@ safeguardPlan ::
   m [Mapping]
 safeguardPlan plan = do
   pid <- getCurrentPid
-  uncurry (++) <$> foldrM (work pid) ([], []) plan
+  (_, xs, ys) <- foldrM (work pid) (mempty, [], []) plan
+  pure $ xs ++ ys
   where
-    (srcs, _dsts) = mappingSets plan
-    work pid (Mapping src dst ren) (rest, post)
+    work pid (Mapping src dst ren) (srcs, rest, post)
       | dst `S.member` srcs = do
           uniqueIdx <- nextUniqueNum
           let tmp =
@@ -1030,9 +1033,17 @@ safeguardPlan plan = do
                   ++ show pid
                   ++ "_"
                   ++ show uniqueIdx
-          pure (Mapping src tmp ren : rest, Mapping tmp dst ren : post)
+          pure
+            ( srcs & at src ?~ (),
+              Mapping src tmp ren : rest,
+              Mapping tmp dst ren : post
+            )
       | otherwise =
-          pure (Mapping src dst ren : rest, post)
+          pure
+            ( srcs & at src ?~ (),
+              Mapping src dst ren : rest,
+              post
+            )
 
 buildPlan ::
   ( MonadReader Options m,
@@ -1202,10 +1213,10 @@ safeMoveFile label src dst
       isFile <- doesFileExist dst
       if isFile
         then do
-          logErr' $
-            "Destination already exists, cannot copy: "
+          logWarn $
+            "Destination already exists, appending + suffix: "
               ++ label src dst
-          pure 1
+          safeMoveFile label src (dropExtension dst ++ "+" ++ takeExtension dst)
         else do
           copyFileWithMetadata src dst
           safeRemoveFile src
