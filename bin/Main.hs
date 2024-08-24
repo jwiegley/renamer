@@ -11,11 +11,22 @@ import Data.Aeson (encodeFile)
 import Data.Foldable (forM_)
 import Data.Maybe (isJust)
 import Data.Time (TimeZone, getCurrentTime, getTimeZone)
-import Fixtures (AppT, allPaths, loadDetails, runAppT, runSimulationAtPid)
+import Fixtures (allPaths, loadDetails, runAppT, runSimulationAtPid)
 import GHC.Conc (setNumCapabilities)
 import Options.Applicative hiding (command)
 import Options.Applicative qualified as OA
-import Renamer (Command (..), Options (..), Verbosity (Normal), determineScenario, execute, putStrLn_, renamerExecute, safePruneDirectory, scenarioInputs, scenarioMappings, scenarioPid, scenarioRepository, scenarioTo)
+import Renamer
+  ( Command (..),
+    Options (..),
+    determineScenario,
+    execute,
+    renamerExecute,
+    safePruneDirectory,
+    scenarioInputs,
+    scenarioPid,
+    scenarioRepository,
+    scenarioTo,
+  )
 import System.Exit (ExitCode (ExitFailure), exitSuccess, exitWith)
 import System.IO (hFlush, stdout)
 
@@ -38,11 +49,11 @@ main = do
   (opts, cmd) <- getOptions
   _ <- GHC.Conc.setNumCapabilities (_jobs opts)
   tz <- getTimeZone =<< getCurrentTime
-  errors <- runAppT opts $ case cmd of
+  errors <- case cmd of
     RenamePhotos repos ->
-      renamePhotos tz repos [] Nothing
+      renamePhotos opts tz repos [] Nothing
     ImportPhotos repos destDir inputs ->
-      renamePhotos tz repos inputs (Just destDir)
+      renamePhotos opts tz repos inputs (Just destDir)
   if errors == 0
     then exitSuccess
     else exitWith (ExitFailure (fromIntegral errors))
@@ -146,33 +157,37 @@ main = do
           )
 
 renamePhotos ::
+  Options ->
   TimeZone ->
   [FilePath] ->
   [FilePath] ->
   Maybe FilePath ->
-  AppT IO Integer
-renamePhotos tz repos inputs mdest = do
-  scenario <- determineScenario tz repos inputs mdest
-  mtoPath <- view scenarioTo
-  forM_ mtoPath $ \toPath ->
-    liftIO $ encodeFile toPath scenario
+  IO Integer
+renamePhotos opts tz repos inputs mdest = do
+  (scenario, errors) <- runAppT opts $ do
+    s <- determineScenario tz repos inputs mdest
+    mtoPath <- view scenarioTo
+    forM_ mtoPath $ \toPath ->
+      liftIO $ encodeFile toPath s
+    exe <- view execute
+    if exe
+      then (s,) <$> go s
+      else pure (s, 0)
 
-  opts <- view id
-  exe <- view execute
-  if exe
-    then go scenario
+  if _execute opts
+    then pure errors
     else do
-      liftIO $ hFlush stdout
-      let (errors, paths) =
+      hFlush stdout
+      let (errors', paths) =
             runSimulationAtPid (fromIntegral (scenario ^. scenarioPid)) $ do
               loadDetails (scenario ^. scenarioRepository)
               loadDetails (scenario ^. scenarioInputs)
               errs <- runAppT opts $ go scenario
               (errs,) <$> allPaths
-      liftIO $ hFlush stdout
-      putStrLn_ Normal "Resulting pathnames would be:"
-      forM_ paths $ putStrLn_ Normal
-      pure errors
+      hFlush stdout
+      putStrLn "Resulting pathnames would be:"
+      mapM_ putStrLn paths
+      pure (errors + errors')
   where
     go scenario = do
       errors <- renamerExecute tz scenario

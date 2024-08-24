@@ -1227,8 +1227,9 @@ executePlan tz plan = do
       ++ " operations)..."
   results <- forM plan $ \(Mapping src dst ren) ->
     safeMoveFile (renamingLabel tz ren) src dst
-  putStrLn_ Normal "Renaming complete!"
-  pure $ sum results
+  let errors = sum results
+  putStrLn_ Normal $ "Renaming completed with " ++ show errors ++ " errors"
+  pure errors
 
 renamerExecute ::
   ( MonadReader Options m,
