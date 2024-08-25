@@ -1,16 +1,62 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE ViewPatterns #-}
 
-module Renamer where
+module Renamer
+  ( Command (..),
+    MonadJSON (..),
+    MonadLog (..),
+    MonadProc (..),
+    MonadParallel (..),
+    MonadPhoto (..),
+    MonadFSRead (..),
+    MonadFSWrite (..),
+    Reason (..),
+    Renaming (Renaming),
+    HasRenaming (..),
+    Mapping,
+    Scenario (..),
+    Prefix (Prefix),
+    HasScenario (..),
+    PhotoGroup (PhotoGroup),
+    FileDetails,
+    HasFileDetails (..),
+    Options (Options),
+    HasOptions (..),
+    defaultOptions,
+    Verbosity (..),
+    putStrLn_,
+    whenDebug,
+    scenarioDetails,
+    determineScenario,
+    renamerExecute,
+    buildPlan,
+    executePlan,
+    groupPhotos,
+    computeRenamings,
+    cleanRenamings,
+    gatherDetails,
+    renderMappings,
+    renderDetails,
+    processDetails,
+    groupRenamingsBy,
+    idempotentRenaming,
+    removeRedundantRenamings,
+    safePruneDirectory,
+    AppT,
+    runAppT,
+  )
+where
 
 import Control.Applicative
 import Control.Concurrent.ParallelIO qualified as PIO
@@ -20,19 +66,25 @@ import Control.Monad (when)
 import Control.Monad.Reader
 import Control.Monad.State
 import Control.Monad.Trans.Maybe
-import Data.Aeson hiding (Error, Options, decodeFileStrict, encodeFile, (.=))
+import Data.Aeson hiding
+  ( Error,
+    Options,
+    decodeFileStrict,
+    defaultOptions,
+    encodeFile,
+    (.=),
+  )
 import Data.Aeson qualified as JSON hiding (Error)
 import Data.Char (toLower)
-import Data.Foldable (foldrM, forM_)
+import Data.Foldable (find, foldrM, forM_)
 import Data.Function (on)
 import Data.HashMap.Strict (HashMap)
 import Data.HashSet (HashSet)
-import Data.List (group, groupBy, nub, partition, sort, sortOn)
+import Data.IntSet (IntSet)
+import Data.List (group, nub, sort, sortOn)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.List.NonEmpty qualified as NE
-import Data.Map.Strict (Map)
-import Data.Map.Strict qualified as M
-import Data.Set qualified as S
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing)
 import Data.Time
 import Data.Traversable (forM)
 import Debug.Trace (traceM)
@@ -40,26 +92,15 @@ import GHC.Generics (Generic)
 import System.Directory qualified as Dir
 import System.Exit
 import System.FilePath
+import System.IO (hFlush, stdout)
 import System.Process (Pid, readProcessWithExitCode)
 import System.Process qualified as Proc
 import Text.Printf
-import Text.Regex.TDFA
+import Text.Regex.TDFA hiding (after, before)
 import Text.Regex.TDFA.String ()
 import Text.Show.Pretty (ppShow)
 import Prelude hiding (putStrLn)
 import Prelude qualified as Pre (putStrLn)
-
-class Has e a where
-  within :: Lens' e a
-
-instance Has (a, b) b where
-  within = _2
-
-instance Has (a, b) a where
-  within = _1
-
-instance Has a a where
-  within = id
 
 strToLower :: String -> String
 strToLower = Prelude.map toLower
@@ -95,10 +136,6 @@ isImage ext = case strToLower ext of
   ".webp" -> True
   _ -> False
 
-type Checksum = String
-
-type Extension = String
-
 data FileDetails = FileDetails
   { _captureTime :: Maybe UTCTime,
     _filepath :: FilePath, -- "/foo/bar.CR3"
@@ -110,59 +147,17 @@ data FileDetails = FileDetails
   }
   deriving (Eq, Ord, Show, Generic)
 
-makeLenses ''FileDetails
+makeClassy ''FileDetails
 
 instance ToJSON FileDetails where
   toEncoding = genericToEncoding JSON.defaultOptions
 
 instance FromJSON FileDetails
 
-type DetailsMap = HashMap FilePath FileDetails
-
--- These are listed in order of priority, when multiple conflicting renamings
--- are found.
-data Renaming
-  = SimpleRename UTCTime
-  | FollowBase FilePath
-  | FollowTime FilePath
-  deriving (Eq, Ord, Show, Generic)
-
-makePrisms ''Renaming
-
-instance ToJSON Renaming where
-  toEncoding = genericToEncoding JSON.defaultOptions
-
-instance FromJSON Renaming
-
-data Renamed a = Renamed
-  { _sourceDetails :: FileDetails,
-    _renamedTo :: a,
-    _renaming :: Renaming
-  }
-  deriving (Eq, Show, Generic)
-
-makeLenses ''Renamed
-
-instance (ToJSON a) => ToJSON (Renamed a) where
-  toEncoding = genericToEncoding JSON.defaultOptions
-
-instance (FromJSON a) => FromJSON (Renamed a)
-
-newtype Prefix = Prefix {getPrefix :: FilePath}
-  deriving (Eq, Ord, Show, Generic)
-
-sourcePath :: Lens' (Renamed a) FilePath
-sourcePath = sourceDetails . filepath
-
-targetPath :: Maybe FilePath -> Renamed FilePath -> FilePath
-targetPath destDir r =
-  case destDir of
-    Just d -> d </> r ^. renamedTo
-    Nothing -> r ^. sourceDetails . filedir </> r ^. renamedTo
-
 -- | State of the image repository (new or old).
 data RenamerState = RenamerState
-  { _dailyCounter :: HashMap String Integer,
+  { _nameCounter :: HashMap String Int,
+    _nameReservations :: HashMap String IntSet,
     -- | Mapping from file basename to list of entries sharing that basename,
     --   and whatever renaming has been determined for that base
     _entriesAtBase :: HashMap FilePath [FileDetails],
@@ -173,7 +168,7 @@ data RenamerState = RenamerState
   }
   deriving (Show, Generic)
 
-makeLenses ''RenamerState
+makeClassy ''RenamerState
 
 instance ToJSON RenamerState where
   toEncoding = genericToEncoding JSON.defaultOptions
@@ -183,7 +178,8 @@ instance FromJSON RenamerState
 newRenamerState :: RenamerState
 newRenamerState =
   RenamerState
-    { _dailyCounter = mempty,
+    { _nameCounter = mempty,
+      _nameReservations = mempty,
       _entriesAtBase = mempty,
       _renamedEntries = mempty,
       _uniqueCounter = 0,
@@ -222,7 +218,7 @@ data Options = Options
   }
   deriving (Show, Eq)
 
-makeLenses ''Options
+makeClassy ''Options
 
 defaultOptions :: Options
 defaultOptions =
@@ -244,7 +240,9 @@ class (Monad m) => MonadLog m where
   printLog :: String -> m ()
 
 instance MonadLog IO where
-  printLog = Pre.putStrLn
+  printLog str = do
+    Pre.putStrLn str
+    hFlush stdout
 
 instance (MonadLog m) => MonadLog (ReaderT e m) where
   printLog = lift . printLog
@@ -279,15 +277,14 @@ putStrLn_ verb s = do
 
 logErr ::
   ( MonadReader Options m,
-    Has e RenamerState,
-    MonadState e m,
+    MonadState RenamerState m,
     MonadLog m
   ) =>
   String ->
   m ()
 logErr msg = do
   putStrLn_ Error $ "ERROR: " ++ msg
-  within . errorCount += 1
+  errorCount += 1
 
 logWarn ::
   ( MonadReader Options m,
@@ -297,56 +294,130 @@ logWarn ::
   m ()
 logWarn msg = putStrLn_ Normal $ "WARNING: " ++ msg
 
-logErr' ::
-  ( MonadReader Options m,
-    MonadLog m
-  ) =>
-  String ->
-  m ()
-logErr' msg = putStrLn_ Error $ "ERROR: " ++ msg
-
 {-------------------------------------------------------------------------
  - Step 3: Database manipulation
  -}
 
-addToList :: (IxValue a ~ [b], Eq b, At a) => Index a -> b -> a -> a
-addToList k v m = case m ^? ix k of
-  Just vs
-    | v `elem` vs -> m
-    | otherwise -> m & ix k %~ (v :)
-  Nothing -> m & at k ?~ [v]
+newtype Prefix = Prefix {getPrefix :: FilePath}
+  deriving (Eq, Ord, Show, Generic)
 
-setIfMissing :: (IxValue a ~ b, Eq b, At a) => Index a -> b -> a -> a
-setIfMissing k v m = case m ^? ix k of
-  Just _ -> m
-  Nothing -> m & at k ?~ v
+instance ToJSON Prefix where
+  toEncoding = genericToEncoding JSON.defaultOptions
+
+instance FromJSON Prefix
+
+fileroot :: Bool -> Lens' FileDetails FilePath
+fileroot spanDirs f s
+  | spanDirs =
+      let ext = s ^. fileext
+       in ( \path ->
+              s
+                & filepath .~ s ^. filedir </> path <.> ext
+                & filename .~ path <.> ext
+                & filebase .~ path
+          )
+            <$> f (s ^. filebase)
+  | otherwise =
+      let ext = s ^. fileext
+       in ( \path ->
+              s
+                & filepath .~ path <.> ext
+                & filedir .~ takeDirectory path
+                & filename .~ takeFileName path <.> ext
+                & filebase .~ takeBaseName path
+          )
+            <$> f (dropExtension (s ^. filepath))
+
+yymmdd :: LocalTime -> String
+yymmdd = formatTime defaultTimeLocale "%y%m%d"
+
+normalizeExt :: String -> String
+normalizeExt ext = case strToLower ext of
+  ".jpeg" -> ".jpg"
+  ".tiff" -> ".tif"
+  ext' -> ext'
+
+-- Given a directory /foo/bar, this calculates what the "key" directory is for
+-- calculations related to the counter.
+keyDir :: Bool -> Maybe FilePath -> FilePath -> FilePath
+keyDir True _ _ = ""
+keyDir _spanDirs@False Nothing dir = dir
+keyDir _spanDirs@False _destDir@(Just dir) _ = dir
+
+goalPath ::
+  Maybe FilePath ->
+  FileDetails ->
+  Prefix ->
+  Int ->
+  FilePath
+goalPath destDir details (Prefix prefix) num =
+  fromMaybe (details ^. filedir) destDir
+    </> prefix
+    ++ "_"
+    ++ printf "%04d" num
+      <.> normalizeExt (details ^. fileext)
+
+nextNameCounter ::
+  (MonadReader Options m, MonadState RenamerState m) =>
+  Prefix ->
+  m Int
+nextNameCounter (Prefix prefix) = do
+  spanDirs <- view spanDirectories
+  preuse (nameCounter . ix prefix) >>= \case
+    Just idx -> go spanDirs idx
+    Nothing -> do
+      nameCounter . at prefix ?= 1
+      go spanDirs 1
+  where
+    go spanDirs i = do
+      nameCounter . ix prefix += 1
+      preuse (nameReservations . ix prefix) >>= \case
+        Just s | has (ix i) s -> go spanDirs (succ i)
+        _ -> pure i
 
 nameRe :: String
 nameRe = "^([0-9][0-9][0-9][0-9][0-9][0-9])_([0-9][0-9][0-9][0-9])$"
 
-registerCounter ::
-  (Has e RenamerState, MonadState e m) =>
-  (FilePath -> FilePath) ->
-  FilePath ->
-  m ()
-registerCounter f path = case path =~ nameRe of
-  [(_ : ymd : counter : [])] ->
+maybeWithCounter :: (Monad m) => FilePath -> (String -> Int -> m ()) -> m ()
+maybeWithCounter path f = case takeBaseName path =~ nameRe of
+  [(_ : prefix : counter : [])] ->
     forM_
       ( parseTimeM
           False
           defaultTimeLocale
           "%0y%0m%0d"
-          ymd ::
+          prefix ::
           Maybe UTCTime
       )
-      $ \_ ->
-        let ymd' = f ymd
-         in preuse (within . dailyCounter . ix ymd') >>= \case
-              Just count ->
-                within . dailyCounter . at ymd' ?= max count (read counter + 1)
-              Nothing ->
-                within . dailyCounter . at ymd' ?= read counter + 1
+      $ \_ -> f prefix (read counter)
   _ -> pure ()
+
+maybeUpdateNameCounter ::
+  (MonadReader Options m, MonadState RenamerState m) =>
+  Maybe FilePath ->
+  FilePath ->
+  m ()
+maybeUpdateNameCounter destDir path =
+  maybeWithCounter path $ \prefix counter -> do
+    spanDirs <- view spanDirectories
+    nameCounter . at (keyDir spanDirs destDir (takeDirectory path) </> prefix)
+      %= Just . \case
+        Just count -> max count (succ counter)
+        Nothing -> succ counter
+
+maybeReserveCounter ::
+  (MonadReader Options m, MonadState RenamerState m) =>
+  Maybe FilePath ->
+  FilePath ->
+  m ()
+maybeReserveCounter destDir path =
+  maybeWithCounter path $ \prefix counter -> do
+    spanDirs <- view spanDirectories
+    nameReservations
+      . at (keyDir spanDirs destDir (takeDirectory path) </> prefix)
+      %= Just . \case
+        Just s -> s & at counter ?~ ()
+        Nothing -> mempty & at counter ?~ ()
 
 {-------------------------------------------------------------------------
  - Step 4: Analyze
@@ -398,42 +469,6 @@ instance (MonadPhoto m) => MonadPhoto (ReaderT e m) where
 
 instance (MonadPhoto m) => MonadPhoto (StateT s m) where
   photoCaptureDate = lift . photoCaptureDate
-
-exiftoolSubSecDateTimeOriginal :: FilePath -> MaybeT IO UTCTime
-exiftoolSubSecDateTimeOriginal path = do
-  (ec, out, _err) <-
-    liftIO $
-      readProcessWithExitCode
-        "exiftool"
-        ["-SubSecDateTimeOriginal", path]
-        ""
-  MaybeT $ pure $ case ec of
-    ExitSuccess ->
-      parseTimeM
-        False
-        defaultTimeLocale
-        "Date/Time Original              : %0Y:%0m:%0d %0H:%0M:%0S%Q%Ez\n"
-        out
-    ExitFailure _code -> Nothing
-
-exiftoolDateTimeOriginal :: FilePath -> MaybeT IO UTCTime
-exiftoolDateTimeOriginal path = do
-  (ec, out, _err) <-
-    liftIO $
-      readProcessWithExitCode
-        "exiftool"
-        ["-DateTimeOriginal", path]
-        ""
-  MaybeT $
-    pure $
-      case ec of
-        ExitSuccess ->
-          parseTimeM
-            False
-            defaultTimeLocale
-            "Date/Time Original              : %0Y:%0m:%0d %0H:%0M:%0S\n"
-            out
-        ExitFailure _code -> Nothing
 
 class (Monad m) => MonadFSRead m where
   listDirectory :: FilePath -> m [FilePath]
@@ -499,14 +534,49 @@ instance (MonadJSON m) => MonadJSON (StateT s m) where
   decodeFileStrict = lift . decodeFileStrict
   encodeFile = (lift .) . encodeFile
 
+exiftoolSubSecDateTimeOriginal :: FilePath -> MaybeT IO UTCTime
+exiftoolSubSecDateTimeOriginal path = do
+  (ec, out, _err) <-
+    liftIO $
+      readProcessWithExitCode
+        "exiftool"
+        ["-SubSecDateTimeOriginal", path]
+        ""
+  MaybeT $ pure $ case ec of
+    ExitSuccess ->
+      parseTimeM
+        False
+        defaultTimeLocale
+        "Date/Time Original              : %0Y:%0m:%0d %0H:%0M:%0S%Q%Ez\n"
+        out
+    ExitFailure _code -> Nothing
+
+exiftoolDateTimeOriginal :: FilePath -> MaybeT IO UTCTime
+exiftoolDateTimeOriginal path = do
+  (ec, out, _err) <-
+    liftIO $
+      readProcessWithExitCode
+        "exiftool"
+        ["-DateTimeOriginal", path]
+        ""
+  MaybeT $
+    pure $
+      case ec of
+        ExitSuccess ->
+          parseTimeM
+            False
+            defaultTimeLocale
+            "Date/Time Original              : %0Y:%0m:%0d %0H:%0M:%0S\n"
+            out
+        ExitFailure _code -> Nothing
+
 renderDetails ::
   (MonadReader Options m, MonadLog m) =>
   [FileDetails] ->
   m ()
 renderDetails = mapM_ $ \d ->
   putStrLn_ Debug $
-    d ^. filepath
-      ++ maybe "" ((" @ " ++) . show) (d ^. captureTime)
+    d ^. filepath ++ maybe "" ((" @ " ++) . show) (d ^. captureTime)
 
 getFileDetails ::
   (MonadPhoto m, MonadFSRead m) =>
@@ -528,16 +598,6 @@ getFileDetails _filepath = do
     _filename = takeFileName _filepath
     _filebase = takeBaseName _filepath
     _fileext = takeExtension _filepath
-
-registerFileDetails ::
-  (Has e RenamerState, MonadState e m) =>
-  Maybe FilePath ->
-  FileDetails ->
-  m FileDetails
-registerFileDetails mdest FileDetails {..} = do
-  forM_ mdest $ \destDir ->
-    registerCounter (destDir </>) _filebase
-  pure FileDetails {..}
 
 walkFileEntries ::
   (MonadFSRead m, MonadLog m) =>
@@ -609,8 +669,18 @@ gatherDetails = concatMapM $ \entry -> do
   stopGlobalPool
   pure details
 
+registerFileDetails ::
+  (MonadReader Options m, MonadState RenamerState m) =>
+  Maybe FilePath ->
+  FileDetails ->
+  m FileDetails
+registerFileDetails destDir FileDetails {..} = do
+  when (isJust destDir) $
+    maybeUpdateNameCounter destDir _filepath
+  pure FileDetails {..}
+
 processDetails ::
-  (Has e RenamerState, MonadState e m) =>
+  (MonadReader Options m, MonadState RenamerState m) =>
   Maybe FilePath ->
   [FileDetails] ->
   m [FileDetails]
@@ -620,280 +690,233 @@ processDetails mdest = mapM (registerFileDetails mdest) . sort
  - Step 5: Naming
  -}
 
-yymmdd :: LocalTime -> String
-yymmdd = formatTime defaultTimeLocale "%y%m%d"
+-- Why is this file in the photo group?
+data Reason
+  = ForTime UTCTime
+  | ForBase FilePath
+  deriving (Eq, Ord, Show, Generic)
 
-nextSeqNum :: (Has e RenamerState, MonadState e m) => String -> m Integer
-nextSeqNum ymd =
-  preuse (within . dailyCounter . ix ymd) >>= \case
-    Just idx -> idx <$ (within . dailyCounter . ix ymd += 1)
-    Nothing -> 1 <$ (within . dailyCounter . at ymd ?= 2)
+makePrisms ''Reason
 
-nextUniqueNum :: (Has e RenamerState, MonadState e m) => m Integer
-nextUniqueNum = do
-  uniqueIdx <- use (within . uniqueCounter)
-  within . uniqueCounter += 1
-  pure uniqueIdx
+instance ToJSON Reason where
+  toEncoding = genericToEncoding JSON.defaultOptions
 
-normalizeExt :: String -> String
-normalizeExt ext = case strToLower ext of
-  ".jpeg" -> ".jpg"
-  ".tiff" -> ".tif"
-  ext' -> ext'
+instance FromJSON Reason
 
-renderRenamings ::
-  (MonadReader Options m, MonadLog m) =>
-  [Renamed a] ->
-  m ()
-renderRenamings = mapM_ $ \r ->
-  putStrLn_ Debug $
-    r ^. sourceDetails . filepath
-      ++ " >> "
-      ++ show (r ^. renaming)
+-- A photo group is a set of files that will all receive the same name minus
+-- extension, and so all entries must have different normalized extensions.
+data PhotoGroup = PhotoGroup (NonEmpty (FileDetails, Reason)) Prefix
+  deriving (Eq, Ord, Show, Generic)
+
+instance ToJSON PhotoGroup where
+  toEncoding = genericToEncoding JSON.defaultOptions
+
+instance FromJSON PhotoGroup
+
+data Renaming a b = Renaming
+  { _renamingFrom :: a,
+    _renamingTo :: b,
+    _renamingFor :: Reason
+  }
+  deriving (Eq, Show, Generic)
+
+makeClassy ''Renaming
+
+instance (ToJSON a, ToJSON b) => ToJSON (Renaming a b) where
+  toEncoding = genericToEncoding JSON.defaultOptions
+
+instance (FromJSON a, FromJSON b) => FromJSON (Renaming a b)
 
 hasUniqueExts :: [FileDetails] -> Bool
-hasUniqueExts =
-  null . duplicatedElements . map (normalizeExt . (^. fileext))
+hasUniqueExts = null . duplicatedElements . map (normalizeExt . (^. fileext))
 
--- | Also rename files that are "close" to files being renamed. For example,
---   so that FOO.JPG moves to BAR.JPG when we rename FOO.CR3 to BAR.CR3. This
---   association can happen either due to both files having the same
---   timestamp, or the same basename (which is needed for files that have no
---   capture timestamp, like XMP).
-siblingRenamings :: [FileDetails] -> [Renamed FilePath] -> [Renamed FilePath]
-siblingRenamings xs = concatMap go
-  where
-    siblings :: HashMap (FilePath, FilePath) [FileDetails]
-    siblings =
-      Prelude.foldl'
-        (\m x -> addToList (x ^. filedir, x ^. filebase) x m)
-        mempty
-        xs
+prefixFromTime :: FilePath -> TimeZone -> UTCTime -> Prefix
+prefixFromTime path tz tm = Prefix (path </> yymmdd (utcToLocalTime tz tm))
 
-    go (Renamed details newname _ren) =
-      case siblings
-        ^? ix (details ^. filedir, details ^. filebase)
-          . to (partition (\y -> y ^. fileext == details ^. fileext)) of
-        Just (ys, zs)
-          | ys == [details]
-              && not (null zs)
-              && hasUniqueExts zs
-              && all
-                ( \z -> case z ^. captureTime of
-                    Nothing -> True
-                    tm -> tm == details ^. captureTime
-                )
-                zs ->
-              Prelude.map
-                ( \z ->
-                    Renamed
-                      z
-                      (name z)
-                      (FollowBase (details ^. filepath))
-                )
-                zs
-        _ -> []
-      where
-        base = takeBaseName newname
-        name d = base <.> ext d
-        ext d = normalizeExt (d ^. fileext)
-
-expectedPrefix :: TimeZone -> FileDetails -> Maybe FilePath
-expectedPrefix tz details = do
-  tm <- details ^. captureTime
-  pure $ yymmdd (utcToLocalTime tz tm)
-
-targetFilepath :: TimeZone -> FileDetails -> Integer -> FilePath
-targetFilepath tz details num = case expectedPrefix tz details of
-  Just prefix ->
-    details ^. filedir
-      </> prefix
-      ++ "_"
-      ++ printf "%04d" num
-        <.> normalizeExt (details ^. fileext)
-  Nothing -> details ^. filepath
-
-groupByTime :: Bool -> [FileDetails] -> [[FileDetails]]
-groupByTime spanDirs = groupBy $ \x y ->
-  case (x ^. captureTime, y ^. captureTime) of
-    (Just tmx, Just tmy) ->
-      tmx == tmy && (spanDirs || x ^. filedir == y ^. filedir)
-    _ -> False
-
-groupByBase :: Bool -> [FileDetails] -> [[FileDetails]]
-groupByBase spanDirs = groupBy ((==) `on` dropExtension . pathPart)
-  where
-    pathPart x
-      | spanDirs = x ^. filename
-      | otherwise = x ^. filepath
+-- Even if two files have the same base name, if they have capture times that
+-- differ, we do not group them together.
+groupDetailsByTime :: Bool -> [FileDetails] -> [NonEmpty FileDetails]
+groupDetailsByTime spanDirs = NE.groupBy $ \x y ->
+  (spanDirs || x ^. filedir == y ^. filedir)
+    && case (x ^. captureTime, y ^. captureTime) of
+      (Just tmx, Just tmy) -> tmx == tmy
+      _ -> False
 
 -- If a group has the same time, or the same base, and there is more than one
 -- of each file extension, then we cannot be certain and must split up that
 -- group, reporting this fact to the user.
-splitNonUniqueGroups :: [[FileDetails]] -> [[FileDetails]]
-splitNonUniqueGroups = foldr go []
+keepGroupsIf :: (NonEmpty a -> Bool) -> [NonEmpty a] -> [NonEmpty a]
+keepGroupsIf f = foldr go []
   where
     go xs rest
-      | hasUniqueExts xs = xs : rest
-      | otherwise = Prelude.map (: []) xs ++ rest
+      | f xs = xs : rest
+      | otherwise = NE.toList (NE.map (:| []) xs) ++ rest
 
-basicRenamings ::
-  TimeZone ->
-  [FileDetails] ->
-  [Maybe (Renamed Prefix)]
-basicRenamings tz = Prelude.map $ \details -> do
-  tm <- details ^. captureTime
-  pure $
-    Renamed
-      details
-      (Prefix (yymmdd (utcToLocalTime tz tm)))
-      (SimpleRename tm)
-
--- | Map photos with capture times to an file having the name YYMMDD_NNNN,
---   where NNNN is a sequence number ordered by time of capture.
---
---   If multiple photos have the same timestamp, and all have different file
---   extensions, then these are all given the same sequence number. If there
---   are overlapping extensions, then all photos are given unique sequence
---   numbers.
---
---   Note that this function aims to be very simple, and so does not perform
---   every possible optimization, such as removing needless renamings that
---   would be idempotent.
-simpleRenamings' ::
-  TimeZone ->
-  [FileDetails] ->
-  [Renamed Prefix]
-simpleRenamings' tz = concatMap go . M.toAscList . contemporaries
+gathering :: (a -> a -> Bool) -> [NonEmpty a] -> [NonEmpty a]
+gathering f = foldr go []
   where
-    contemporaries :: [FileDetails] -> Map (FilePath, UTCTime) [FileDetails]
-    contemporaries =
-      Prelude.foldl'
-        ( \m x ->
-            maybe
-              m
-              (\tm -> addToList (x ^. filedir, tm) x m)
-              (x ^. captureTime)
+    go xs@(x :| []) rest =
+      case after of
+        [] -> xs : rest
+        (y : ys) -> before ++ NE.append y xs : ys
+      where
+        (before, after) =
+          break (\ys -> isJust (find (f x) ys)) rest
+    go xs rest = xs : rest
+
+gatherRoots :: Bool -> [NonEmpty FileDetails] -> [NonEmpty FileDetails]
+gatherRoots spanDirs = gathering $ \x y ->
+  isNothing (x ^. captureTime)
+    && isJust (y ^. captureTime)
+    && x ^. fileroot spanDirs == y ^. fileroot spanDirs
+
+-- This is the most complex function in the renamer, since it's job is to turn
+-- a set of file details into an identified set of files and photo groups.
+groupPhotos ::
+  Bool ->
+  Maybe FilePath ->
+  TimeZone ->
+  [FileDetails] ->
+  [Either FileDetails PhotoGroup]
+groupPhotos spanDirs destDir tz =
+  Prelude.map go
+    . gatherRoots spanDirs
+    . keepGroupsIf (hasUniqueExts . NE.toList)
+    . groupDetailsByTime spanDirs
+  where
+    key = keyDir spanDirs destDir
+
+    go (d :| []) = case d ^. captureTime of
+      Just tm ->
+        Right $
+          PhotoGroup
+            ((d, ForTime tm) :| [])
+            (prefixFromTime (key (d ^. filedir)) tz tm)
+      Nothing ->
+        Left d
+    go ds =
+      Right
+        ( PhotoGroup
+            (NE.map (\d -> (d, reason d)) ds)
+            (prefixFromTime (key getDir) tz getTime)
         )
-        mempty
-
-    go ((_dir, tm), reverse -> entries) = entries'
       where
-        entries'
-          | hasUniqueExts entries = rename (SimpleRename tm) entries
-          | otherwise =
-              concatMap (rename (SimpleRename tm) . (: [])) entries
+        reason d =
+          maybe
+            (ForBase (d ^. fileroot spanDirs))
+            ForTime
+            (d ^. captureTime)
 
-        rename _ [] = []
-        rename ren (e : es) =
-          work ren e
-            : Prelude.map (work (FollowTime (e ^. filename))) es
-          where
-            work r details = Renamed details (Prefix base) r
+        times = catMaybes (NE.toList (NE.map (^. captureTime) ds))
 
-            base = yymmdd (utcToLocalTime tz tm)
+        getTime = case nub times of
+          [tm] -> tm
+          _ -> error "computeRenamings: unexpected times"
 
-mapWithPrevM :: (Monad m) => (c -> a -> m (c, b)) -> c -> [a] -> m [b]
-mapWithPrevM f = go
-  where
-    go _ [] = pure []
-    go z (x : xs) = do
-      (c, y) <- f z x
-      (y :) <$> go c xs
+        dirs = NE.toList (NE.map (^. filedir) ds)
 
-applySequenceNumbers ::
-  (MonadReader Options m, Has e RenamerState, MonadState e m) =>
+        getDir = case nub dirs of
+          [dir] -> dir
+          _ -> error "computeRenamings: unexpected directories"
+
+computeRenamings ::
+  (MonadReader Options m, MonadState RenamerState m) =>
   Maybe FilePath ->
-  [Renamed Prefix] ->
-  m [Renamed FilePath]
-applySequenceNumbers mdest = mapWithPrevM go 0
+  [Either FileDetails PhotoGroup] ->
+  m [Mapping]
+computeRenamings destDir = concatMapM go . sort
   where
-    go lastSeqNum (Renamed d (Prefix n) r) = case r of
-      SimpleRename _ -> do
-        spanDirs <- view spanDirectories
-        num <- nextSeqNum (seqIndex spanDirs n)
-        pure (num, Renamed d (name n num) r)
-      FollowTime _ ->
-        -- jww (2024-08-24): lookup name in a mapping from names to seqnums,
-        -- rather than depending on the order.
-        pure (lastSeqNum, Renamed d (name n lastSeqNum) r)
-      FollowBase _ -> error "Unexpected"
+    go (Left x) = [] <$ maybeReserveCounter destDir (x ^. filepath)
+    go (Right (PhotoGroup xs (Prefix prefix))) = do
+      num <- nextNameCounter (Prefix prefix)
+      pure $
+        NE.toList $
+          NE.map
+            ( \(x, r) ->
+                Renaming
+                  (x ^. filepath)
+                  (goalPath destDir x (Prefix (takeBaseName prefix)) num)
+                  r
+            )
+            xs
+
+mappingLabel :: TimeZone -> Renaming FilePath FilePath -> String
+mappingLabel tz ren =
+  ren ^. renamingFrom
+    ++ case ren ^. renamingFor of
+      ForTime tm -> " (" ++ formattedTime tm ++ ")-> "
+      ForBase name -> " [" ++ name ++ "]-> "
+    ++ ren ^. renamingTo
+  where
+    formattedTime tm =
+      formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S%Q" tm'
       where
-        name base num = base ++ "_" ++ printf "%04d" num <.> ext
-        ext = normalizeExt (d ^. fileext)
+        tm' = utcToLocalTime tz tm
 
-        seqIndex spanDirs = case mdest of
-          Nothing
-            | spanDirs -> id
-            | otherwise -> (d ^. filedir </>)
-          Just destDir -> (destDir </>)
-
-simpleRenamings ::
-  (MonadReader Options m, Has e RenamerState, MonadState e m) =>
+renderMappings ::
+  (MonadReader Options m, MonadLog m) =>
   TimeZone ->
-  Maybe FilePath ->
-  [FileDetails] ->
-  m [Renamed FilePath]
-simpleRenamings tz mdest = applySequenceNumbers mdest . simpleRenamings' tz
+  [Mapping] ->
+  m ()
+renderMappings tz = mapM_ $ \r ->
+  putStrLn_ Debug $ mappingLabel tz r
 
 -- | Entries that would rename a file to itself.
-idempotentRenaming :: Maybe FilePath -> Renamed FilePath -> Bool
-idempotentRenaming destDir ren =
-  ren ^. sourcePath == targetPath destDir ren
+idempotentRenaming :: Mapping -> Bool
+idempotentRenaming ren = ren ^. renamingFrom == ren ^. renamingTo
 
 reportIdempotentRenamings ::
-  (MonadReader Options m, Has e RenamerState, MonadState e m, MonadLog m) =>
-  Maybe FilePath ->
-  [Renamed FilePath] ->
+  (MonadReader Options m, MonadState RenamerState m, MonadLog m) =>
+  TimeZone ->
+  [Mapping] ->
   m ()
-reportIdempotentRenamings destDir rs =
-  forM_ (filter (idempotentRenaming destDir) rs) $ \ren ->
+reportIdempotentRenamings tz rs =
+  forM_ (filter idempotentRenaming rs) $ \ren ->
     logErr $
-      "Renaming file to itself: " ++ show ren
+      "Renaming file to itself: " ++ mappingLabel tz ren
 
 redundantRenaming ::
-  Maybe FilePath ->
-  Renamed FilePath ->
-  Renamed FilePath ->
+  Mapping ->
+  Mapping ->
   Bool
-redundantRenaming destDir rx ry =
-  rx ^. sourcePath == ry ^. sourcePath
-    && targetPath destDir rx == targetPath destDir ry
+redundantRenaming rx ry =
+  rx ^. renamingFrom == ry ^. renamingFrom
+    && rx ^. renamingTo == ry ^. renamingTo
 
 removeRedundantRenamings ::
-  (Renamed FilePath -> FilePath) ->
-  Maybe FilePath ->
-  [Renamed FilePath] ->
-  [Renamed FilePath]
-removeRedundantRenamings f destDir =
+  (Mapping -> FilePath) ->
+  [Mapping] ->
+  [Mapping]
+removeRedundantRenamings f =
   -- Prelude.map NE.head . sortAndGroupOn f
-  Prelude.map NE.head . NE.groupBy (redundantRenaming destDir) . sortOn f
+  Prelude.map NE.head . NE.groupBy redundantRenaming . sortOn f
 
 groupRenamingsBy ::
-  (Renamed FilePath -> FilePath) ->
-  [Renamed FilePath] ->
-  [NonEmpty (Renamed FilePath)]
+  (Mapping -> FilePath) ->
+  [Mapping] ->
+  [NonEmpty (Mapping)]
 groupRenamingsBy f = filter (\xs -> NE.length xs > 1) . sortAndGroupOn f
 
 removeOverlappedRenamings ::
-  Maybe FilePath ->
-  [Renamed FilePath] ->
-  ([Renamed FilePath], [(Renamed FilePath, NonEmpty (Renamed FilePath))])
-removeOverlappedRenamings destDir rs =
+  [Mapping] ->
+  ( [Mapping],
+    [(Mapping, NonEmpty (Mapping))]
+  )
+removeOverlappedRenamings rs =
   ( Prelude.map fst rs'',
     onlyOverlaps rs' ++ onlyOverlaps rs''
   )
   where
-    rs' = nonOverlapped (^. sourcePath) rs
-    rs'' = nonOverlapped (targetPath destDir) (Prelude.map fst rs')
+    rs' = nonOverlapped (^. renamingFrom) rs
+    rs'' = nonOverlapped (^. renamingTo) (Prelude.map fst rs')
 
     nonOverlapped f =
       foldr
         ( \rens rest ->
-            let k r = case r ^. renaming of
-                  FollowBase _ ->
-                    r ^. sourceDetails . filepath
-                      `notElem` rest ^.. traverse . _1 . renaming . _FollowBase
+            let k r = case r ^. renamingFor of
+                  ForBase _ ->
+                    r ^. renamingFrom
+                      `notElem` rest ^.. traverse . _1 . renamingFor . _ForBase
                   _ -> True
              in -- We can't do a trivial sort here, which might select
                 -- FollowsBase for two entries that each follow each other.
@@ -905,7 +928,7 @@ removeOverlappedRenamings destDir rs =
                 --   A [B]-> C   B (U)-> F
                 -- where a simple sort would have chosen
                 --   A [B]-> C   B [A]-> E
-                case sortOn (^. renaming) (NE.filter k rens) of
+                case sortOn (^. renamingFor) (NE.filter k rens) of
                   [] -> error "Unexpected: removeOverlappedRenamings"
                   y : ys -> (y, ys) : rest
         )
@@ -917,72 +940,26 @@ removeOverlappedRenamings destDir rs =
       y : ys -> [(x, y :| ys)]
 
 reportOverlappedSources ::
-  (MonadReader Options m, Has e RenamerState, MonadState e m, MonadLog m) =>
-  Maybe FilePath ->
-  [Renamed FilePath] ->
+  (MonadReader Options m, MonadState RenamerState m, MonadLog m) =>
+  TimeZone ->
+  [Mapping] ->
   m ()
-reportOverlappedSources destDir rs =
-  forM_ (groupRenamingsBy (^. sourcePath) rs) $ \dsts ->
+reportOverlappedSources tz rs =
+  forM_ (groupRenamingsBy (^. renamingFrom) rs) $ \dsts ->
     forM_ dsts $ \dst ->
       logErr $
-        "Overlapped source: "
-          ++ dst ^. sourcePath
-          ++ " -> "
-          ++ targetPath destDir dst
+        "Overlapped source: " ++ mappingLabel tz dst
 
 reportOverlappedTargets ::
-  (MonadReader Options m, Has e RenamerState, MonadState e m, MonadLog m) =>
-  Maybe FilePath ->
-  [Renamed FilePath] ->
+  (MonadReader Options m, MonadState RenamerState m, MonadLog m) =>
+  TimeZone ->
+  [Mapping] ->
   m ()
-reportOverlappedTargets destDir rs =
-  forM_ (groupRenamingsBy (targetPath destDir) rs) $ \srcs ->
+reportOverlappedTargets tz rs =
+  forM_ (groupRenamingsBy (^. renamingTo) rs) $ \srcs ->
     forM_ srcs $ \src ->
       logErr $
-        "Overlapped target: "
-          ++ src ^. sourcePath
-          ++ " -> "
-          ++ targetPath destDir src
-
-renamingLabel :: TimeZone -> Renamed FilePath -> FilePath -> FilePath -> String
-renamingLabel tz ren srcPath dstPath =
-  srcPath
-    ++ case ren ^. renaming of
-      SimpleRename tm -> " (" ++ formattedTime tm ++ ")-> "
-      FollowBase name -> " [" ++ name ++ "]-> "
-      FollowTime name -> " {" ++ name ++ "}-> "
-    ++ dstPath
-  where
-    formattedTime tm =
-      formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S%Q" tm'
-      where
-        tm' = utcToLocalTime tz tm
-
-data RenamingSet = RenamingSet
-  { _allSimpleRenamings :: [Renamed FilePath],
-    _allSiblingRenamings :: [Renamed FilePath],
-    _allRenamingsWithoutRedundancies :: [Renamed FilePath],
-    -- | All remainings includes both simple and sibling renamings, and is
-    --   clear of idempotent, redundant and overlapped renamings.
-    _allRenamings :: [Renamed FilePath]
-  }
-  deriving (Eq, Show, Generic)
-
-makeLenses ''RenamingSet
-
-instance ToJSON RenamingSet where
-  toEncoding = genericToEncoding JSON.defaultOptions
-
-instance FromJSON RenamingSet
-
-newRenamingSet :: RenamingSet
-newRenamingSet =
-  RenamingSet
-    { _allSimpleRenamings = [],
-      _allSiblingRenamings = [],
-      _allRenamingsWithoutRedundancies = [],
-      _allRenamings = []
-    }
+        "Overlapped target: " ++ mappingLabel tz src
 
 -- | Determine the ideal name for a given photo, in the context of the
 --   repository where it is meant to abide. Note that this function is called
@@ -998,88 +975,64 @@ newRenamingSet =
 --
 --   4. If it is the alternate version (different extension) of an existing
 --      photo, it should share the sequence number.
-renameFiles ::
-  (MonadReader Options m, Has e RenamerState, MonadState e m, MonadLog m) =>
+cleanRenamings ::
+  (MonadReader Options m, MonadState RenamerState m, MonadLog m) =>
   TimeZone ->
-  Maybe FilePath ->
-  [FileDetails] ->
-  m RenamingSet
-renameFiles tz destDir ds = do
-  rs1 <- simpleRenamings tz destDir ds
-  let rs1' = filter (not . idempotentRenaming destDir) rs1
-      rs2 = siblingRenamings ds rs1'
-      rs3 = rs1' ++ rs2
+  [Mapping] ->
+  m [Mapping]
+cleanRenamings tz rs =
   assert
     ( Prelude.all
-        (\g -> length (NE.filter (has (renaming . _SimpleRename)) g) < 2)
-        (groupRenamingsBy (^. sourcePath) rs3)
+        (\g -> length (NE.filter (has (renamingFor . _ForTime)) g) < 2)
+        (groupRenamingsBy (^. renamingFrom) rs)
     )
     $ do
-      let rs4 =
-            removeRedundantRenamings (targetPath destDir) destDir $
-              removeRedundantRenamings (^. sourcePath) destDir $
-                filter (not . idempotentRenaming destDir) $
-                  rs3
-          (rs5, overlaps) = removeOverlappedRenamings destDir rs4
+      let rs' =
+            removeRedundantRenamings (^. renamingTo) $
+              removeRedundantRenamings (^. renamingFrom) $
+                filter (not . idempotentRenaming) $
+                  rs
+          (rs'', overlaps) = removeOverlappedRenamings rs'
       forM_ overlaps $ \(x, ys) -> do
         putStrLn_ Normal $ "Preferring this renaming:"
-        putStrLn_ Normal $
-          "    "
-            ++ renamingLabel tz x (x ^. sourcePath) (targetPath destDir x)
+        putStrLn_ Normal $ "    " ++ mappingLabel tz x
         putStrLn_ Normal $ "  over these:"
         forM_ ys $ \y ->
-          putStrLn_ Normal $
-            "    "
-              ++ renamingLabel tz y (y ^. sourcePath) (targetPath destDir y)
-      pure $ RenamingSet rs1 rs2 rs4 rs5
+          putStrLn_ Normal $ "    " ++ mappingLabel tz y
+      pure rs''
 
 {-------------------------------------------------------------------------
  - Step 6: Plan
  -}
 
-data Mapping = Mapping
-  { _sourceFile :: FilePath,
-    _targetFile :: FilePath,
-    _renamingRef :: Renamed FilePath
-  }
-  deriving (Eq, Show, Generic)
+type Mapping = Renaming FilePath FilePath
 
-makeLenses ''Mapping
+nextUniqueNum :: (MonadState RenamerState m) => m Integer
+nextUniqueNum = do
+  uniqueIdx <- use uniqueCounter
+  uniqueCounter += 1
+  pure uniqueIdx
 
-instance ToJSON Mapping where
-  toEncoding = genericToEncoding JSON.defaultOptions
-
-instance FromJSON Mapping
-
-renderMappings ::
+buildPlan ::
   ( MonadReader Options m,
-    Has e RenamerState,
-    MonadState e m,
+    MonadState RenamerState m,
+    MonadProc m,
     MonadLog m
   ) =>
-  [Mapping] ->
-  m ()
-renderMappings = mapM_ $ \(Mapping src dst _) ->
-  putStrLn_ Debug $ src ++ " >>> " ++ dst
-
-buildBasicPlan ::
-  Maybe FilePath ->
-  [Renamed FilePath] ->
-  [Mapping]
-buildBasicPlan destDir = Prelude.map $ \ren ->
-  Mapping (ren ^. sourcePath) (targetPath destDir ren) ren
-
-safeguardPlan ::
-  (Has e RenamerState, MonadState e m, MonadProc m, MonadLog m) =>
+  TimeZone ->
   [Mapping] ->
   m [Mapping]
-safeguardPlan plan = do
+buildPlan tz plan = do
+  reportIdempotentRenamings tz plan
+  reportOverlappedSources tz plan
+  reportOverlappedTargets tz plan
+
   pid <- getCurrentPid
-  (_, xs, ys) <- foldrM (work pid) (mempty, [], []) plan
+  (_, xs, ys) <- foldrM (work pid) (mempty :: HashSet FilePath, [], []) plan
   pure $ xs ++ ys
   where
-    work pid (Mapping src dst ren) (srcs, rest, post)
-      | dst `S.member` srcs = do
+    work pid (Renaming src dst ren) (srcs, rest, post)
+      | has (ix dst) srcs = do
           uniqueIdx <- nextUniqueNum
           let tmp =
                 takeDirectory dst
@@ -1089,31 +1042,15 @@ safeguardPlan plan = do
                   ++ show uniqueIdx
           pure
             ( srcs & at src ?~ (),
-              Mapping src tmp ren : rest,
-              Mapping tmp dst ren : post
+              Renaming src tmp ren : rest,
+              Renaming tmp dst ren : post
             )
       | otherwise =
           pure
             ( srcs & at src ?~ (),
-              Mapping src dst ren : rest,
+              Renaming src dst ren : rest,
               post
             )
-
-buildPlan ::
-  ( MonadReader Options m,
-    Has e RenamerState,
-    MonadState e m,
-    MonadProc m,
-    MonadLog m
-  ) =>
-  Maybe FilePath ->
-  [Renamed FilePath] ->
-  m [Mapping]
-buildPlan destDir rs = do
-  reportIdempotentRenamings destDir rs
-  reportOverlappedSources destDir rs
-  reportOverlappedTargets destDir rs
-  safeguardPlan (buildBasicPlan destDir rs)
 
 {-------------------------------------------------------------------------
  - Step 7: Execute
@@ -1125,34 +1062,52 @@ data Scenario = Scenario
     _scenarioRepository :: [FileDetails],
     _scenarioDestination :: Maybe FilePath,
     _scenarioInputs :: [FileDetails],
-    _scenarioRenamings :: RenamingSet,
+    _scenarioPhotoGroups :: [Either FileDetails PhotoGroup],
+    _scenarioSimpleRenamings :: [Mapping],
+    _scenarioRenamings :: [Mapping],
     _scenarioMappings :: [Mapping]
   }
-  deriving (Show, Generic)
+  deriving (Eq, Show, Generic)
 
-makeLenses ''Scenario
+makeClassy ''Scenario
 
 instance ToJSON Scenario where
   toEncoding = genericToEncoding JSON.defaultOptions
 
 instance FromJSON Scenario
 
-newScenario :: Scenario
-newScenario =
-  Scenario
-    { _scenarioPid = 0,
-      _scenarioTimeZoneMinutes = 0,
-      _scenarioRepository = [],
-      _scenarioDestination = Nothing,
-      _scenarioInputs = [],
-      _scenarioRenamings = newRenamingSet,
-      _scenarioMappings = []
-    }
+scenarioDetails ::
+  ( MonadReader Options m,
+    MonadState RenamerState m,
+    MonadProc m,
+    MonadFSRead m,
+    MonadJSON m,
+    MonadParallel m,
+    MonadPhoto m,
+    MonadLog m
+  ) =>
+  [FilePath] ->
+  [FilePath] ->
+  Maybe FilePath ->
+  m ([FileDetails], [FileDetails])
+scenarioDetails repos inputs destDir = do
+  putStrLn_ Normal "Gathering details..."
+  rds <-
+    if null repos
+      then pure []
+      else
+        gatherDetails repos
+          >>= processDetails destDir
+  whenDebug $ renderDetails rds
+  ds <-
+    gatherDetails inputs
+      >>= processDetails destDir
+  whenDebug $ renderDetails ds
+  pure (rds, ds)
 
 determineScenario ::
   ( MonadReader Options m,
-    Has e RenamerState,
-    MonadState e m,
+    MonadState RenamerState m,
     MonadProc m,
     MonadFSRead m,
     MonadJSON m,
@@ -1161,58 +1116,48 @@ determineScenario ::
     MonadLog m
   ) =>
   TimeZone ->
-  [FilePath] ->
-  [FilePath] ->
+  [FileDetails] ->
+  [FileDetails] ->
   Maybe FilePath ->
   m Scenario
 determineScenario
   tz
-  _scenarioRepositories
+  _scenarioRepository
   _scenarioInputs
   _scenarioDestination = do
     _scenarioPid <- fromIntegral <$> getCurrentPid
     let _scenarioTimeZoneMinutes = timeZoneMinutes tz
-    (_scenarioRepository, _scenarioInputs) <- doGatherDetails
-    _scenarioRenamings <-
+    (_scenarioPhotoGroups, _scenarioSimpleRenamings, _scenarioRenamings) <-
       doRenameFiles
         ( if null _scenarioInputs
             then _scenarioRepository
             else _scenarioInputs
         )
-    _scenarioMappings <- doBuildPlan (_scenarioRenamings ^. allRenamings)
+    _scenarioMappings <- doBuildPlan _scenarioRenamings
     pure Scenario {..}
     where
-      doGatherDetails = do
-        putStrLn_ Normal "Gathering details..."
-        rds <-
-          if null _scenarioRepositories
-            then pure []
-            else
-              gatherDetails _scenarioRepositories
-                >>= processDetails _scenarioDestination
-        ds <-
-          gatherDetails _scenarioInputs
-            >>= processDetails _scenarioDestination
-        whenDebug $ renderDetails rds
-        whenDebug $ renderDetails ds
-        pure (rds, ds)
-
       doRenameFiles details = do
         putStrLn_ Normal $
           "Determining expected file names (from "
             ++ show (length details)
             ++ " entries)..."
-        rs <- renameFiles tz _scenarioDestination details
-        whenDebug $ renderRenamings (rs ^. allRenamings)
-        pure rs
+
+        spanDirs <- view spanDirectories
+        let gs = groupPhotos spanDirs _scenarioDestination utc details
+        whenDebug $ forM_ gs $ putStrLn_ Debug . ppShow
+        srs <- computeRenamings _scenarioDestination gs
+        whenDebug $ renderMappings tz srs
+        rs <- cleanRenamings tz srs
+        whenDebug $ renderMappings tz rs
+        pure (gs, srs, rs)
 
       doBuildPlan renamings = do
         putStrLn_ Normal $
           "Building renaming plan (from "
             ++ show (length renamings)
             ++ " renamings)..."
-        p <- buildPlan _scenarioDestination renamings
-        whenDebug $ renderMappings p
+        p <- buildPlan tz renamings
+        whenDebug $ renderMappings tz p
         pure p
 
 safeRemoveDirectory ::
@@ -1253,7 +1198,7 @@ safeMoveFile ::
     MonadFSRead m,
     MonadFSWrite m
   ) =>
-  (FilePath -> FilePath -> String) ->
+  String ->
   FilePath ->
   FilePath ->
   m Integer
@@ -1263,13 +1208,13 @@ safeMoveFile label src dst
       renameFile src dst
       pure 0
   | otherwise = do
-      putStrLn_ Verbose $ label src dst
+      putStrLn_ Verbose label
       isFile <- doesFileExist dst
       if isFile
         then do
           logWarn $
             "Destination already exists, appending + suffix: "
-              ++ label src dst
+              ++ label
           safeMoveFile label src (dropExtension dst ++ "+" ++ takeExtension dst)
         else do
           copyFileWithMetadata src dst
@@ -1290,16 +1235,15 @@ executePlan tz plan = do
     "Executing renaming plan ("
       ++ show (length plan)
       ++ " operations)..."
-  results <- forM plan $ \(Mapping src dst ren) ->
-    safeMoveFile (renamingLabel tz ren) src dst
+  results <- forM plan $ \ren@(Renaming src dst _) ->
+    safeMoveFile (mappingLabel tz ren) src dst
   let errors = sum results
   putStrLn_ Normal $ "Renaming completed with " ++ show errors ++ " errors"
   pure errors
 
 renamerExecute ::
   ( MonadReader Options m,
-    Has e RenamerState,
-    MonadState e m,
+    MonadState RenamerState m,
     MonadLog m,
     MonadFSRead m,
     MonadFSWrite m
@@ -1307,8 +1251,13 @@ renamerExecute ::
   TimeZone ->
   Scenario ->
   m Integer
-renamerExecute tz scenario = do
-  errors <- use (within . errorCount)
+renamerExecute tz s = do
+  errors <- use errorCount
   if errors > 0
     then errors <$ logErr "Cannot execute renaming plan with errors"
-    else executePlan tz (scenario ^. scenarioMappings)
+    else executePlan tz (s ^. scenarioMappings)
+
+type AppT m = ReaderT Options (StateT RenamerState m)
+
+runAppT :: (Monad m) => Options -> AppT m a -> m a
+runAppT opts k = evalStateT (runReaderT k opts) newRenamerState

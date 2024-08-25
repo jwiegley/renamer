@@ -11,23 +11,22 @@ import Control.Monad.IO.Class (liftIO)
 import Data.Foldable (forM_)
 import Data.Maybe (isJust)
 import Data.Time (TimeZone, getCurrentTime, getTimeZone)
-import Fixtures (allPaths, loadDetails, runAppT, runSimulationAtPid)
+import Fixtures (allPaths, loadDetails, runSimulationAtPid)
 import GHC.Conc (setNumCapabilities)
 import Options.Applicative hiding (command)
 import Options.Applicative qualified as OA
 import Renamer
   ( Command (..),
+    HasOptions (..),
+    HasScenario (..),
     MonadJSON (..),
-    Options (..),
+    Options (Options),
     determineScenario,
     execute,
     renamerExecute,
+    runAppT,
     safePruneDirectory,
-    scenarioFrom,
-    scenarioInputs,
-    scenarioPid,
-    scenarioRepository,
-    scenarioTo,
+    scenarioDetails,
   )
 import System.Exit (ExitCode (ExitFailure), exitSuccess, exitWith)
 import System.IO (hFlush, stdout)
@@ -49,7 +48,7 @@ summary =
 main :: IO ()
 main = do
   (opts, cmd) <- getOptions
-  _ <- GHC.Conc.setNumCapabilities (_jobs opts)
+  _ <- GHC.Conc.setNumCapabilities (opts ^. jobs)
   tz <- getTimeZone =<< getCurrentTime
   errors <- case cmd of
     RenamePhotos repos ->
@@ -175,8 +174,8 @@ renamePhotos ::
   [FilePath] ->
   Maybe FilePath ->
   IO Integer
-renamePhotos opts tz repos inputs mdest = do
-  (scenario, errors) <- runAppT opts $ do
+renamePhotos opts tz repos inputs destDir = do
+  (s, errors) <- runAppT opts $ do
     s <-
       view scenarioFrom >>= \case
         Just fromPath -> do
@@ -184,7 +183,9 @@ renamePhotos opts tz repos inputs mdest = do
           case mres of
             Just s -> pure s
             Nothing -> error $ "Failed to read scenario from " ++ fromPath
-        Nothing -> determineScenario tz repos inputs mdest
+        Nothing -> do
+          (rds, ds) <- scenarioDetails repos inputs destDir
+          determineScenario tz rds ds destDir
     mtoPath <- view scenarioTo
     forM_ mtoPath $ \toPath ->
       liftIO $ encodeFile toPath s
@@ -193,23 +194,23 @@ renamePhotos opts tz repos inputs mdest = do
       then (s,) <$> go s
       else pure (s, 0)
 
-  if _execute opts
+  if opts ^. execute
     then pure errors
     else do
       hFlush stdout
       let (errors', paths) =
-            runSimulationAtPid (fromIntegral (scenario ^. scenarioPid)) $ do
-              loadDetails (scenario ^. scenarioRepository)
-              loadDetails (scenario ^. scenarioInputs)
-              errs <- runAppT opts $ go scenario
+            runSimulationAtPid (fromIntegral (s ^. scenarioPid)) $ do
+              loadDetails (s ^. scenarioRepository)
+              loadDetails (s ^. scenarioInputs)
+              errs <- runAppT opts $ go s
               (errs,) <$> allPaths
       hFlush stdout
       putStrLn "Resulting pathnames would be:"
       mapM_ putStrLn paths
       pure (errors + errors')
   where
-    go scenario = do
-      errors <- renamerExecute tz scenario
-      when (errors == 0 && isJust mdest) $
+    go s = do
+      errors <- renamerExecute tz s
+      when (errors == 0 && isJust destDir) $
         mapM_ safePruneDirectory inputs
       pure errors
