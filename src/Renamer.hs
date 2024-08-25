@@ -27,7 +27,7 @@ import Data.Foldable (foldrM, forM_)
 import Data.Function (on)
 import Data.HashMap.Strict (HashMap)
 import Data.HashSet (HashSet)
-import Data.List (group, nub, partition, sort, sortOn)
+import Data.List (group, groupBy, nub, partition, sort, sortOn)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict (Map)
@@ -698,6 +698,57 @@ siblingRenamings xs = concatMap go
         name d = base <.> ext d
         ext d = normalizeExt (d ^. fileext)
 
+expectedPrefix :: TimeZone -> FileDetails -> Maybe FilePath
+expectedPrefix tz details = do
+  tm <- details ^. captureTime
+  pure $ yymmdd (utcToLocalTime tz tm)
+
+targetFilepath :: TimeZone -> FileDetails -> Integer -> FilePath
+targetFilepath tz details num = case expectedPrefix tz details of
+  Just prefix ->
+    details ^. filedir
+      </> prefix
+      ++ "_"
+      ++ printf "%04d" num
+        <.> normalizeExt (details ^. fileext)
+  Nothing -> details ^. filepath
+
+groupByTime :: Bool -> [FileDetails] -> [[FileDetails]]
+groupByTime spanDirs = groupBy $ \x y ->
+  case (x ^. captureTime, y ^. captureTime) of
+    (Just tmx, Just tmy) ->
+      tmx == tmy && (spanDirs || x ^. filedir == y ^. filedir)
+    _ -> False
+
+groupByBase :: Bool -> [FileDetails] -> [[FileDetails]]
+groupByBase spanDirs = groupBy ((==) `on` dropExtension . pathPart)
+  where
+    pathPart x
+      | spanDirs = x ^. filename
+      | otherwise = x ^. filepath
+
+-- If a group has the same time, or the same base, and there is more than one
+-- of each file extension, then we cannot be certain and must split up that
+-- group, reporting this fact to the user.
+splitNonUniqueGroups :: [[FileDetails]] -> [[FileDetails]]
+splitNonUniqueGroups = foldr go []
+  where
+    go xs rest
+      | hasUniqueExts xs = xs : rest
+      | otherwise = Prelude.map (: []) xs ++ rest
+
+basicRenamings ::
+  TimeZone ->
+  [FileDetails] ->
+  [Maybe (Renamed Prefix)]
+basicRenamings tz = Prelude.map $ \details -> do
+  tm <- details ^. captureTime
+  pure $
+    Renamed
+      details
+      (Prefix (yymmdd (utcToLocalTime tz tm)))
+      (SimpleRename tm)
+
 -- | Map photos with capture times to an file having the name YYMMDD_NNNN,
 --   where NNNN is a sequence number ordered by time of capture.
 --
@@ -715,8 +766,7 @@ simpleRenamings' ::
   [Renamed Prefix]
 simpleRenamings' tz = concatMap go . M.toAscList . contemporaries
   where
-    contemporaries ::
-      [FileDetails] -> Map (FilePath, UTCTime) [FileDetails]
+    contemporaries :: [FileDetails] -> Map (FilePath, UTCTime) [FileDetails]
     contemporaries =
       Prelude.foldl'
         ( \m x ->
