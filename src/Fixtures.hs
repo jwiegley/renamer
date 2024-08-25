@@ -91,7 +91,7 @@ instance MonadJSON Simulation where
 
 lookupPath :: FileTree -> FilePath -> Maybe FileTree
 lookupPath tree path =
-  foldl' go (Just tree) (splitDirectories path)
+  foldl' go (Just tree) (splitDirectories (strToLower path))
   where
     go (Just (DirEntry xs)) s
       | Just x <- xs ^? ix s = Just x
@@ -102,11 +102,12 @@ adjustPath ::
   FilePath ->
   (Maybe FileTree -> Maybe FileTree) ->
   FileTree
-adjustPath tree path f = go tree (splitDirectories path)
+adjustPath tree path f = go tree (splitDirectories (strToLower path))
   where
     go _ [] = error "Empty path"
     go (FileEntry _ _) _ = error "Attempt to descend into file"
-    go (DirEntry xs) (s : ss) = DirEntry (xs & at s .~ work)
+    go (DirEntry xs) (s : ss) =
+      DirEntry (xs & at s .~ work)
       where
         work = case xs ^? ix s of
           Nothing

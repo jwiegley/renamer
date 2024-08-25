@@ -113,7 +113,7 @@ testFollowTime = testCase "time" $ do
 
 testFollowTimeNoOverlap :: TestTree
 testFollowTimeNoOverlap = testCase "timeNoOverlap" $ do
-  let ((Scenario _ _ [f24jpg, f24cr2, f134jpg] _ _ _ srs rs _, 0), paths) =
+  let ((Scenario _ _ [f24cr2, f24jpg, f134jpg] _ _ _ srs rs _, 0), paths) =
         runSimulation $ do
           photo "test/120404_0024.JPG" "2012-04-04T16:04:50Z"
           photo "test/120404_0024.cr2" "2012-04-04T16:04:50Z"
@@ -121,12 +121,12 @@ testFollowTimeNoOverlap = testCase "timeNoOverlap" $ do
           renamerNoIdemCheck ["test"] [] Nothing
   srs
     @?== [ forTime
-             f24jpg
-             "test/120404_0001.jpg"
+             f24cr2
+             "test/120404_0001.cr2"
              "2012-04-04T16:04:50Z",
            forTime
-             f24cr2
-             "test/120404_0002.cr2"
+             f24jpg
+             "test/120404_0002.jpg"
              "2012-04-04T16:04:50Z",
            forTime
              f134jpg
@@ -135,24 +135,24 @@ testFollowTimeNoOverlap = testCase "timeNoOverlap" $ do
          ]
   groupRenamingsBy (^. renamingFrom) rs @?== []
   paths
-    @?== [ "test/120404_0001.jpg",
-           "test/120404_0002.cr2",
+    @?== [ "test/120404_0001.cr2",
+           "test/120404_0002.jpg",
            "test/120404_0003.jpg"
          ]
-  let ((Scenario _ _ [f1jpg, f2cr2, f3jpg] _ _ _ srs' rs' _, 0), paths') =
+  let ((Scenario _ _ [f1cr2, f2jpg, f3jpg] _ _ _ srs' rs' _, 0), paths') =
         runSimulation $ do
+          photo "test/120404_0001.cr2" "2012-04-04T16:04:50Z"
+          photo "test/120404_0002.jpg" "2012-04-04T16:04:50Z"
           photo "test/120404_0003.jpg" "2012-04-04T16:04:50Z"
-          photo "test/120404_0002.cr2" "2012-04-04T16:04:50Z"
-          photo "test/120404_0001.jpg" "2012-04-04T16:04:50Z"
           renamerNoIdemCheck (reverse paths) [] Nothing
   srs'
     @?== [ forTime
-             f1jpg
-             "test/120404_0001.jpg"
+             f1cr2
+             "test/120404_0001.cr2"
              "2012-04-04T16:04:50Z",
            forTime
-             f2cr2
-             "test/120404_0002.cr2"
+             f2jpg
+             "test/120404_0002.jpg"
              "2012-04-04T16:04:50Z",
            forTime
              f3jpg
@@ -161,8 +161,8 @@ testFollowTimeNoOverlap = testCase "timeNoOverlap" $ do
          ]
   groupRenamingsBy (^. renamingFrom) rs' @?== []
   paths'
-    @?== [ "test/120404_0001.jpg",
-           "test/120404_0002.cr2",
+    @?== [ "test/120404_0001.cr2",
+           "test/120404_0002.jpg",
            "test/120404_0003.jpg"
          ]
 

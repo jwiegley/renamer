@@ -36,6 +36,7 @@ module Renamer
     defaultOptions,
     Verbosity (..),
     putStrLn_,
+    strToLower,
     whenDebug,
     scenarioDetails,
     determineScenario,
@@ -87,7 +88,6 @@ import Data.List.NonEmpty qualified as NE
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing)
 import Data.Time
 import Data.Traversable (forM)
-import Debug.Trace (traceM)
 import GHC.Generics (Generic)
 import System.Directory qualified as Dir
 import System.Exit
@@ -210,7 +210,6 @@ data Options = Options
     _jobs :: !Int,
     _recursive :: !Bool,
     _execute :: !Bool,
-    _caseInsensitive :: !Bool,
     _keepState :: !Bool,
     _spanDirectories :: !Bool,
     _scenarioTo :: !(Maybe FilePath),
@@ -229,7 +228,6 @@ defaultOptions =
       _jobs = 1,
       _recursive = False,
       _execute = False,
-      _caseInsensitive = False,
       _keepState = False,
       _spanDirectories = False,
       _scenarioTo = Nothing,
