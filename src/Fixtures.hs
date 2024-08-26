@@ -25,6 +25,8 @@ import Debug.Trace
 import GHC.Generics
 import Renamer
 import System.FilePath
+import System.IO (hFlush, stdout)
+import System.IO.Unsafe (unsafePerformIO)
 import System.Process (Pid)
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -70,6 +72,7 @@ newtype Simulation a = Simulation {getSimulation :: State Env a}
 
 instance MonadLog Simulation where
   printLog = traceM
+  flushLog = pure $! unsafePerformIO (hFlush stdout)
 
 instance MonadProc Simulation where
   getCurrentPid = use envPid

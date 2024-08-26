@@ -244,17 +244,19 @@ defaultOptions =
 
 class (Monad m) => MonadLog m where
   printLog :: String -> m ()
+  flushLog :: m ()
 
 instance MonadLog IO where
-  printLog str = do
-    Pre.putStrLn str
-    hFlush stdout
+  flushLog = hFlush stdout
+  printLog str = Pre.putStrLn str
 
 instance (MonadLog m) => MonadLog (ReaderT e m) where
   printLog = lift . printLog
+  flushLog = lift flushLog
 
 instance (MonadLog m) => MonadLog (StateT s m) where
   printLog = lift . printLog
+  flushLog = lift flushLog
 
 data Verbosity
   = Error
@@ -266,7 +268,8 @@ data Verbosity
 whenDebug :: (MonadReader Options m) => m () -> m ()
 whenDebug action = do
   d <- view debug
-  when d action
+  e <- view extraDebug
+  when (e || d) action
 
 whenExtraDebug :: (MonadReader Options m) => m () -> m ()
 whenExtraDebug action = do
@@ -298,6 +301,7 @@ logErr ::
   m ()
 logErr msg = do
   putStrLn_ Error $ "ERROR: " ++ msg
+  flushLog
   errorCount += 1
 
 logWarn ::
@@ -306,7 +310,9 @@ logWarn ::
   ) =>
   String ->
   m ()
-logWarn msg = putStrLn_ Normal $ "WARNING: " ++ msg
+logWarn msg = do
+  putStrLn_ Normal $ "WARNING: " ++ msg
+  flushLog
 
 {-------------------------------------------------------------------------
  - Step 3: Database manipulation
@@ -564,11 +570,16 @@ exiftoolDateTimeOriginal path = do
 
 renderDetails ::
   (MonadReader Options m, MonadLog m) =>
+  String ->
   [FileDetails] ->
   m ()
-renderDetails = mapM_ $ \d ->
-  putStrLn_ Debug $
-    d ^. filepath ++ maybe "" ((" @ " ++) . show) (d ^. captureTime)
+renderDetails label ds = do
+  forM_ ds $ \d ->
+    putStrLn_ Debug $
+      label
+        ++ d ^. filepath
+        ++ maybe "" ((" @ " ++) . show) (d ^. captureTime)
+  flushLog
 
 getFileDetails ::
   (MonadPhoto m, MonadFSRead m) =>
@@ -653,6 +664,7 @@ gatherDetails = concatMapM $ \entry -> do
           Just details -> pure details
           Nothing -> do
             putStrLn_ Normal $ "Gathering details from " ++ show entry
+            flushLog
             details <-
               parallelInterleaved
                 =<< walkFileEntries recurse (getFileDetails spanDirs) entry
@@ -661,6 +673,7 @@ gatherDetails = concatMapM $ \entry -> do
             pure details
       else do
         putStrLn_ Normal $ "Gathering details from " ++ show entry
+        flushLog
         parallelInterleaved
           =<< walkFileEntries recurse (getFileDetails spanDirs) entry
   stopGlobalPool
@@ -848,10 +861,14 @@ mappingLabel tz ren =
 
 renderMappings ::
   (MonadReader Options m, MonadLog m) =>
+  String ->
   TimeZone ->
   [Mapping] ->
   m ()
-renderMappings tz = mapM_ $ putStrLn_ Debug . mappingLabel tz
+renderMappings label tz rs = do
+  forM_ rs $
+    putStrLn_ Debug . (label ++) . mappingLabel tz
+  flushLog
 
 -- | Entries that would rename a file to itself.
 idempotentRenaming :: Mapping -> Bool
@@ -959,6 +976,7 @@ cleanRenamings tz rs =
         putStrLn_ Normal $ "  over these:"
         forM_ ys $ \y ->
           putStrLn_ Normal $ "    " ++ mappingLabel tz y
+      flushLog
       pure rs''
 
 {-------------------------------------------------------------------------
@@ -1047,17 +1065,18 @@ scenarioDetails ::
   m ([FileDetails], [FileDetails])
 scenarioDetails repos inputs destDir = do
   putStrLn_ Normal "Gathering details..."
+  flushLog
   rds <-
     if null repos
       then pure []
       else
         gatherDetails repos
           >>= processDetails destDir
-  whenDebug $ renderDetails rds
+  whenDebug $ renderDetails "REPO-DETAIL: " rds
   ds <-
     gatherDetails inputs
       >>= processDetails destDir
-  whenDebug $ renderDetails ds
+  whenDebug $ renderDetails "FROM-DETAIL: " ds
   pure (rds, ds)
 
 determineScenario ::
@@ -1091,28 +1110,33 @@ determineScenario
     _scenarioMappings <- doBuildPlan _scenarioRenamings
     pure Scenario {..}
     where
-      doRenameFiles details = do
+      doRenameFiles ds = do
         putStrLn_ Normal $
           "Determining expected file names (from "
-            ++ show (length details)
+            ++ show (length ds)
             ++ " entries)..."
+        flushLog
 
         spanDirs <- view spanDirectories
-        let gs = groupPhotos spanDirs _scenarioDestination utc details
-        whenExtraDebug $ forM_ gs $ putStrLn_ Debug . ppShow
+        let gs = groupPhotos spanDirs _scenarioDestination utc ds
+        whenExtraDebug $
+          forM_ gs $
+            putStrLn_ ExtraDebug . ("GROUP: " ++) . ppShow
+        flushLog
         srs <- computeRenamings _scenarioDestination gs
-        whenExtraDebug $ renderMappings tz srs
+        whenExtraDebug $ renderMappings "SIMPLE: " tz srs
         rs <- cleanRenamings tz srs
-        whenExtraDebug $ renderMappings tz rs
+        whenExtraDebug $ renderMappings "CLEAN: " tz rs
         pure (gs, srs, rs)
 
-      doBuildPlan renamings = do
+      doBuildPlan rs = do
         putStrLn_ Normal $
           "Building renaming plan (from "
-            ++ show (length renamings)
+            ++ show (length rs)
             ++ " renamings)..."
-        p <- buildPlan renamings
-        whenDebug $ renderMappings tz p
+        flushLog
+        p <- buildPlan rs
+        whenDebug $ renderMappings "PLAN: " tz p
         pure p
 
 safeRemoveDirectory ::
@@ -1121,6 +1145,7 @@ safeRemoveDirectory ::
   m ()
 safeRemoveDirectory path = do
   putStrLn_ Normal $ "- " ++ path
+  flushLog
   removeDirectory path
 
 safePruneDirectory ::
@@ -1152,10 +1177,12 @@ safeMoveFile ::
 safeMoveFile label src dst
   | strToLower src == strToLower dst = do
       putStrLn_ Verbose $ src ++ " => " ++ dst
+      flushLog
       renameFile src dst
       pure 0
   | otherwise = do
       putStrLn_ Verbose label
+      flushLog
       isFile <- doesFileExist dst
       if isFile
         then do
@@ -1182,10 +1209,12 @@ executePlan tz plan = do
     "Executing renaming plan ("
       ++ show (length plan)
       ++ " operations)..."
+  flushLog
   results <- forM plan $ \ren@(Renaming src dst _) ->
     safeMoveFile (mappingLabel tz ren) src dst
   let errors = sum results
   putStrLn_ Normal $ "Renaming completed with " ++ show errors ++ " errors"
+  flushLog
   pure errors
 
 renamerExecute ::
