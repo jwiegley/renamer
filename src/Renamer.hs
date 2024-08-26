@@ -846,18 +846,27 @@ computeRenamings destDir = concatMapM go . sort
             )
             xs
 
-mappingLabel :: TimeZone -> Renaming FilePath FilePath -> String
-mappingLabel tz ren =
-  ren ^. renamingFrom
+mappingLabel' ::
+  TimeZone ->
+  Renaming FilePath FilePath ->
+  FilePath ->
+  FilePath ->
+  String
+mappingLabel' tz ren src dst =
+  src
     ++ case ren ^. renamingFor of
       ForTime tm -> " (" ++ formattedTime tm ++ ")-> "
       ForBase name -> " [" ++ name ++ "]-> "
-    ++ ren ^. renamingTo
+    ++ dst
   where
     formattedTime tm =
       formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S%Q" tm'
       where
         tm' = utcToLocalTime tz tm
+
+mappingLabel :: TimeZone -> Renaming FilePath FilePath -> String
+mappingLabel tz ren =
+  mappingLabel' tz ren (ren ^. renamingFrom) (ren ^. renamingTo)
 
 renderMappings ::
   (MonadReader Options m, MonadLog m) =>
@@ -994,8 +1003,7 @@ nextUniqueNum = do
 buildPlan ::
   ( MonadReader Options m,
     MonadState RenamerState m,
-    MonadProc m,
-    MonadLog m
+    MonadProc m
   ) =>
   [Mapping] ->
   m [Mapping]
@@ -1005,7 +1013,7 @@ buildPlan plan = do
   pure $ xs ++ ys
   where
     work pid (Renaming src dst ren) (srcs, rest, post)
-      | has (ix dst) srcs = do
+      | has (ix (strToLower dst)) srcs = do
           uniqueIdx <- nextUniqueNum
           let tmp =
                 takeDirectory dst
@@ -1014,13 +1022,13 @@ buildPlan plan = do
                   ++ "_"
                   ++ show uniqueIdx
           pure
-            ( srcs & at src ?~ (),
+            ( srcs & at (strToLower src) ?~ (),
               Renaming src tmp ren : rest,
               Renaming tmp dst ren : post
             )
       | otherwise =
           pure
-            ( srcs & at src ?~ (),
+            ( srcs & at (strToLower src) ?~ (),
               Renaming src dst ren : rest,
               post
             )
@@ -1112,7 +1120,7 @@ determineScenario
     where
       doRenameFiles ds = do
         putStrLn_ Normal $
-          "Determining expected file names (from "
+          "Determining photo groups (from "
             ++ show (length ds)
             ++ " entries)..."
         flushLog
@@ -1123,8 +1131,18 @@ determineScenario
           forM_ gs $
             putStrLn_ ExtraDebug . ("GROUP: " ++) . ppShow
         flushLog
+        putStrLn_ Normal $
+          "Computing renamings (from "
+            ++ show (length gs)
+            ++ " files and photo groups)..."
+        flushLog
         srs <- computeRenamings _scenarioDestination gs
         whenExtraDebug $ renderMappings "SIMPLE: " tz srs
+        putStrLn_ Normal $
+          "Cleaning up renamings (from "
+            ++ show (length srs)
+            ++ " initial renamings)..."
+        flushLog
         rs <- cleanRenamings tz srs
         whenExtraDebug $ renderMappings "CLEAN: " tz rs
         pure (gs, srs, rs)
@@ -1133,7 +1151,7 @@ determineScenario
         putStrLn_ Normal $
           "Building renaming plan (from "
             ++ show (length rs)
-            ++ " renamings)..."
+            ++ " final renamings)..."
         flushLog
         p <- buildPlan rs
         whenDebug $ renderMappings "PLAN: " tz p
@@ -1170,7 +1188,7 @@ safeMoveFile ::
     MonadFSRead m,
     MonadFSWrite m
   ) =>
-  String ->
+  (FilePath -> FilePath -> String) ->
   FilePath ->
   FilePath ->
   m Integer
@@ -1181,14 +1199,14 @@ safeMoveFile label src dst
       renameFile src dst
       pure 0
   | otherwise = do
-      putStrLn_ Verbose label
+      putStrLn_ Verbose $ label src dst
       flushLog
       isFile <- doesFileExist dst
       if isFile
         then do
           logWarn $
             "Destination already exists, appending + suffix: "
-              ++ label
+              ++ label src dst
           safeMoveFile label src (dropExtension dst ++ "+" ++ takeExtension dst)
         else do
           copyFileWithMetadata src dst
@@ -1211,7 +1229,7 @@ executePlan tz plan = do
       ++ " operations)..."
   flushLog
   results <- forM plan $ \ren@(Renaming src dst _) ->
-    safeMoveFile (mappingLabel tz ren) src dst
+    safeMoveFile (mappingLabel' tz ren) src dst
   let errors = sum results
   putStrLn_ Normal $ "Renaming completed with " ++ show errors ++ " errors"
   flushLog
