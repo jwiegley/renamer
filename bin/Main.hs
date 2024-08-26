@@ -126,6 +126,11 @@ main = do
               <> long "debug"
               <> help "Report progress at debug level"
           )
+        <*> switch
+          ( short 'D'
+              <> long "extra-debug"
+              <> help "Report progress at extra debug level"
+          )
         <*> option
           auto
           ( short 'j'

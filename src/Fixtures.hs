@@ -90,42 +90,37 @@ instance MonadJSON Simulation where
   encodeFile _ _ = error "encodeFile not used"
 
 lookupPath :: FileTree -> FilePath -> Maybe FileTree
-lookupPath tree path =
-  foldl' go (Just tree) (splitDirectories (strToLower path))
+lookupPath tree = foldl' go (Just tree) . splitDirectories . strToLower
   where
     go (Just (DirEntry xs)) s
       | Just x <- xs ^? ix s = Just x
     go _ _ = Nothing
+    {-# INLINE go #-}
 
 adjustPath ::
   FileTree ->
+  Maybe FileTree ->
   FilePath ->
-  (Maybe FileTree -> Maybe FileTree) ->
   FileTree
-adjustPath tree path f = go tree (splitDirectories (strToLower path))
+adjustPath tree mt = go tree . splitDirectories . strToLower
   where
-    go _ [] = error "Empty path"
-    go (FileEntry _ _) _ = error "Attempt to descend into file"
-    go (DirEntry xs) (s : ss) =
-      DirEntry (xs & at s .~ work)
+    go (DirEntry xs) (s : ss) = DirEntry (xs & at s .~ work)
       where
-        work = case xs ^? ix s of
-          Nothing
-            | null ss -> case f Nothing of
-                Nothing -> error $ "Missing entry " ++ s
-                Just x -> Just x
-            | otherwise -> Just (go (DirEntry mempty) ss)
-          Just x
-            | null ss -> f (Just x)
-            | otherwise -> Just (go x ss)
+        work
+          | null ss = mt
+          | otherwise =
+              Just $ go (xs ^. at s . non (DirEntry mempty)) ss
+        {-# INLINE work #-}
+    go _ _ = error "Unexpected"
+    {-# INLINE go #-}
 
 loadDetails :: [FileDetails] -> Simulation ()
 loadDetails = mapM_ $ \d ->
   envFileTree %= \t ->
     adjustPath
       t
+      (Just (FileEntry (d ^. captureTime) (d ^. filesize)))
       (d ^. filepath)
-      (const (Just (FileEntry (d ^. captureTime) (d ^. filesize))))
 
 instance MonadFSRead Simulation where
   listDirectory path = do
@@ -154,29 +149,26 @@ instance MonadFSWrite Simulation where
     t <- use envFileTree
     case lookupPath t path of
       Just (FileEntry _ _) ->
-        envFileTree .= adjustPath t path (const Nothing)
+        envFileTree .= adjustPath t Nothing path
       _ -> error $ "Not a file: " ++ path
   removeDirectory path = do
     t <- use envFileTree
     case lookupPath t path of
       Just (DirEntry _) ->
-        envFileTree .= adjustPath t path (const Nothing)
+        envFileTree .= adjustPath t Nothing path
       _ -> error $ "Not a directory: " ++ path
   renameFile path dest = do
     t <- use envFileTree
     case lookupPath t path of
       Just x@(FileEntry _ _) ->
         envFileTree
-          .= adjustPath
-            (adjustPath t path (const Nothing))
-            dest
-            (const (Just x))
+          .= adjustPath (adjustPath t Nothing path) (Just x) dest
       _ -> error $ "Not a file: " ++ path
   copyFileWithMetadata path dest = do
     t <- use envFileTree
     case lookupPath t path of
       Just x@(FileEntry _ _) ->
-        envFileTree .= adjustPath t dest (const (Just x))
+        envFileTree .= adjustPath t (Just x) dest
       _ -> error $ "Not a file: " ++ path
 
 time :: String -> UTCTime
@@ -187,18 +179,12 @@ time str = case iso8601ParseM str of
 photo :: FilePath -> String -> Simulation ()
 photo path tm =
   envFileTree %= \t ->
-    adjustPath
-      t
-      path
-      (const (Just (FileEntry (Just (time tm)) 100)))
+    adjustPath t (Just (FileEntry (Just (time tm)) 100)) path
 
 file :: FilePath -> Simulation ()
 file path =
   envFileTree %= \t ->
-    adjustPath
-      t
-      path
-      (const (Just (FileEntry Nothing 100)))
+    adjustPath t (Just (FileEntry Nothing 100)) path
 
 forBase :: FileDetails -> String -> FilePath -> Mapping
 forBase details name n = Renaming (details ^. filepath) name (ForBase n)
@@ -229,7 +215,7 @@ confirmScenario ::
   (MonadLog m, MonadIO m, MonadProc m) =>
   Scenario ->
   m ()
-confirmScenario s = s @?== s'
+confirmScenario s = s' @?== s
   where
     s' =
       runSimulationAtPid (fromIntegral (s ^. scenarioPid))
@@ -328,6 +314,6 @@ importer paths froms destDir setup = do
             >>= computeRenamings (Just destDir)
               . groupPhotos spanDirs (Just destDir) utc
             >>= cleanRenamings utc
-            >>= buildPlan utc
+            >>= buildPlan
             >>= executePlan utc
       (es,) <$> allPaths

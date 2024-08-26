@@ -60,6 +60,7 @@ module Renamer
 where
 
 import Control.Applicative
+import Control.Arrow ((&&&))
 import Control.Concurrent.ParallelIO qualified as PIO
 import Control.Exception (assert)
 import Control.Lens hiding ((<.>))
@@ -77,7 +78,7 @@ import Data.Aeson hiding
   )
 import Data.Aeson qualified as JSON hiding (Error)
 import Data.Char (toLower)
-import Data.Foldable (find, foldrM, forM_)
+import Data.Foldable (Foldable (foldr'), find, foldrM, forM_)
 import Data.Function (on)
 import Data.HashMap.Strict (HashMap)
 import Data.HashSet (HashSet)
@@ -104,16 +105,20 @@ import Prelude qualified as Pre (putStrLn)
 
 strToLower :: String -> String
 strToLower = Prelude.map toLower
+{-# INLINE strToLower #-}
 
 concatMapM :: (Traversable t, Monad m) => (a -> m [b]) -> t a -> m [b]
 concatMapM = (fmap concat .) . mapM
+{-# INLINE concatMapM #-}
 
 duplicatedElements :: (Ord a) => [a] -> [a]
 duplicatedElements =
   nub . concat . filter ((> 1) . length) . group . sort
+{-# INLINE duplicatedElements #-}
 
 sortAndGroupOn :: (Ord b) => (a -> b) -> [a] -> [NonEmpty a]
 sortAndGroupOn f = NE.groupBy ((==) `on` f) . sortOn f
+{-# INLINE sortAndGroupOn #-}
 
 {-------------------------------------------------------------------------
  - Step 1: Schema
@@ -142,6 +147,7 @@ data FileDetails = FileDetails
     _filedir :: FilePath, -- "/foo"
     _filename :: FilePath, -- "bar.CR3"
     _filebase :: FilePath, -- "bar"
+    _fileroot :: FilePath, -- "/foo/bar" or "bar", depending on spanDirectories
     _fileext :: FilePath, -- ".CR3"
     _filesize :: Integer
   }
@@ -207,6 +213,7 @@ data Options = Options
   { _quiet :: !Bool,
     _verbose :: !Bool,
     _debug :: !Bool,
+    _extraDebug :: !Bool,
     _jobs :: !Int,
     _recursive :: !Bool,
     _execute :: !Bool,
@@ -225,6 +232,7 @@ defaultOptions =
     { _quiet = False,
       _verbose = False,
       _debug = False,
+      _extraDebug = False,
       _jobs = 1,
       _recursive = False,
       _execute = False,
@@ -253,21 +261,29 @@ data Verbosity
   | Normal
   | Verbose
   | Debug
+  | ExtraDebug
 
 whenDebug :: (MonadReader Options m) => m () -> m ()
 whenDebug action = do
   d <- view debug
   when d action
 
+whenExtraDebug :: (MonadReader Options m) => m () -> m ()
+whenExtraDebug action = do
+  e <- view extraDebug
+  when e action
+
 putStrLn_ :: (MonadReader Options m, MonadLog m) => Verbosity -> String -> m ()
 putStrLn_ verb s = do
   q <- view quiet
   v <- view verbose
   d <- view debug
+  e <- view extraDebug
   when
     ( case verb of
-        Debug -> not q && d
-        Verbose -> not q && (d || v)
+        ExtraDebug -> not q && e
+        Debug -> not q && (e || d)
+        Verbose -> not q && (e || d || v)
         Normal -> not q
         Error -> True
     )
@@ -303,28 +319,6 @@ instance ToJSON Prefix where
   toEncoding = genericToEncoding JSON.defaultOptions
 
 instance FromJSON Prefix
-
-fileroot :: Bool -> Lens' FileDetails FilePath
-fileroot spanDirs f s
-  | spanDirs =
-      let ext = s ^. fileext
-       in ( \path ->
-              s
-                & filepath .~ s ^. filedir </> path <.> ext
-                & filename .~ path <.> ext
-                & filebase .~ path
-          )
-            <$> f (s ^. filebase)
-  | otherwise =
-      let ext = s ^. fileext
-       in ( \path ->
-              s
-                & filepath .~ path <.> ext
-                & filedir .~ takeDirectory path
-                & filename .~ takeFileName path <.> ext
-                & filebase .~ takeBaseName path
-          )
-            <$> f (dropExtension (s ^. filepath))
 
 yymmdd :: LocalTime -> String
 yymmdd = formatTime defaultTimeLocale "%y%m%d"
@@ -578,9 +572,10 @@ renderDetails = mapM_ $ \d ->
 
 getFileDetails ::
   (MonadPhoto m, MonadFSRead m) =>
+  Bool ->
   FilePath ->
   m FileDetails
-getFileDetails _filepath = do
+getFileDetails spanDirs _filepath = do
   isFile <- doesFileExist _filepath
   if isFile
     then do
@@ -596,6 +591,9 @@ getFileDetails _filepath = do
     _filename = takeFileName _filepath
     _filebase = takeBaseName _filepath
     _fileext = takeExtension _filepath
+    _fileroot
+      | spanDirs = _filebase
+      | otherwise = dropExtension _filepath
 
 walkFileEntries ::
   (MonadFSRead m, MonadLog m) =>
@@ -639,6 +637,7 @@ gatherDetails = concatMapM $ \entry -> do
   --   filepathToIdx
   --   idxToFilepath
   recurse <- view recursive
+  spanDirs <- view spanDirectories
   isDir <- doesDirectoryExist entry
   details <-
     if isDir
@@ -656,14 +655,14 @@ gatherDetails = concatMapM $ \entry -> do
             putStrLn_ Normal $ "Gathering details from " ++ show entry
             details <-
               parallelInterleaved
-                =<< walkFileEntries recurse getFileDetails entry
+                =<< walkFileEntries recurse (getFileDetails spanDirs) entry
             when stateful $
               encodeFile detailsFile details
             pure details
       else do
         putStrLn_ Normal $ "Gathering details from " ++ show entry
         parallelInterleaved
-          =<< walkFileEntries recurse getFileDetails entry
+          =<< walkFileEntries recurse (getFileDetails spanDirs) entry
   stopGlobalPool
   pure details
 
@@ -750,23 +749,24 @@ keepGroupsIf f = foldr go []
       | f xs = xs : rest
       | otherwise = NE.toList (NE.map (:| []) xs) ++ rest
 
-gathering :: (a -> a -> Bool) -> [NonEmpty a] -> [NonEmpty a]
-gathering f = foldr go []
-  where
-    go xs@(x :| []) rest =
-      case after of
-        [] -> xs : rest
-        (y : ys) -> before ++ NE.append y xs : ys
-      where
-        (before, after) =
-          break (\ys -> isJust (find (f x) ys)) rest
-    go xs rest = xs : rest
+exists :: (a -> Bool) -> NonEmpty a -> Bool
+exists f = isJust . find f
+{-# INLINE exists #-}
 
-gatherRoots :: Bool -> [NonEmpty FileDetails] -> [NonEmpty FileDetails]
-gatherRoots spanDirs = gathering $ \x y ->
-  isNothing (x ^. captureTime)
-    && isJust (y ^. captureTime)
-    && x ^. fileroot spanDirs == y ^. fileroot spanDirs
+gatherRoots :: [NonEmpty FileDetails] -> [NonEmpty FileDetails]
+gatherRoots = foldr' go []
+  where
+    go xs@(x :| []) rest
+      | isNothing (x ^. captureTime) = case break (exists (f x)) rest of
+          (_, []) -> xs : rest
+          (before, y : ys) -> before ++ NE.cons x y : ys
+    go xs rest = xs : rest
+    {-# INLINE go #-}
+
+    f x y
+      | isJust (y ^. captureTime) = x ^. fileroot == y ^. fileroot
+      | otherwise = False
+    {-# INLINE f #-}
 
 -- This is the most complex function in the renamer, since it's job is to turn
 -- a set of file details into an identified set of files and photo groups.
@@ -778,7 +778,7 @@ groupPhotos ::
   [Either FileDetails PhotoGroup]
 groupPhotos spanDirs destDir tz =
   Prelude.map go
-    . gatherRoots spanDirs
+    . gatherRoots
     . keepGroupsIf (hasUniqueExts . NE.toList)
     . groupDetailsByTime spanDirs
   where
@@ -790,32 +790,27 @@ groupPhotos spanDirs destDir tz =
           PhotoGroup
             ((d, ForTime tm) :| [])
             (prefixFromTime (key (d ^. filedir)) tz tm)
-      Nothing ->
-        Left d
+      Nothing -> Left d
     go ds =
       Right
         ( PhotoGroup
-            (NE.map (\d -> (d, reason d)) ds)
+            (NE.map (id &&& reason) ds)
             (prefixFromTime (key getDir) tz getTime)
         )
       where
         reason d =
           maybe
-            (ForBase (d ^. fileroot spanDirs))
+            (ForBase (d ^. fileroot))
             ForTime
             (d ^. captureTime)
 
-        times = catMaybes (NE.toList (NE.map (^. captureTime) ds))
+        getTime = case times of
+          (tm : _) -> tm
+          [] -> error "computeRenamings: unexpected times"
+          where
+            times = catMaybes (NE.toList (NE.map (^. captureTime) ds))
 
-        getTime = case nub times of
-          [tm] -> tm
-          _ -> error "computeRenamings: unexpected times"
-
-        dirs = NE.toList (NE.map (^. filedir) ds)
-
-        getDir = case nub dirs of
-          [dir] -> dir
-          _ -> error "computeRenamings: unexpected directories"
+        (getDir :| _) = NE.map (^. filedir) ds
 
 computeRenamings ::
   (MonadReader Options m, MonadState RenamerState m) =>
@@ -856,22 +851,11 @@ renderMappings ::
   TimeZone ->
   [Mapping] ->
   m ()
-renderMappings tz = mapM_ $ \r ->
-  putStrLn_ Debug $ mappingLabel tz r
+renderMappings tz = mapM_ $ putStrLn_ Debug . mappingLabel tz
 
 -- | Entries that would rename a file to itself.
 idempotentRenaming :: Mapping -> Bool
 idempotentRenaming ren = ren ^. renamingFrom == ren ^. renamingTo
-
-reportIdempotentRenamings ::
-  (MonadReader Options m, MonadState RenamerState m, MonadLog m) =>
-  TimeZone ->
-  [Mapping] ->
-  m ()
-reportIdempotentRenamings tz rs =
-  forM_ (filter idempotentRenaming rs) $ \ren ->
-    logErr $
-      "Renaming file to itself: " ++ mappingLabel tz ren
 
 redundantRenaming ::
   Mapping ->
@@ -937,28 +921,6 @@ removeOverlappedRenamings rs =
       [] -> []
       y : ys -> [(x, y :| ys)]
 
-reportOverlappedSources ::
-  (MonadReader Options m, MonadState RenamerState m, MonadLog m) =>
-  TimeZone ->
-  [Mapping] ->
-  m ()
-reportOverlappedSources tz rs =
-  forM_ (groupRenamingsBy (^. renamingFrom) rs) $ \dsts ->
-    forM_ dsts $ \dst ->
-      logErr $
-        "Overlapped source: " ++ mappingLabel tz dst
-
-reportOverlappedTargets ::
-  (MonadReader Options m, MonadState RenamerState m, MonadLog m) =>
-  TimeZone ->
-  [Mapping] ->
-  m ()
-reportOverlappedTargets tz rs =
-  forM_ (groupRenamingsBy (^. renamingTo) rs) $ \srcs ->
-    forM_ srcs $ \src ->
-      logErr $
-        "Overlapped target: " ++ mappingLabel tz src
-
 -- | Determine the ideal name for a given photo, in the context of the
 --   repository where it is meant to abide. Note that this function is called
 --   only after all file details have been gathered throughout the various
@@ -1017,14 +979,9 @@ buildPlan ::
     MonadProc m,
     MonadLog m
   ) =>
-  TimeZone ->
   [Mapping] ->
   m [Mapping]
-buildPlan tz plan = do
-  reportIdempotentRenamings tz plan
-  reportOverlappedSources tz plan
-  reportOverlappedTargets tz plan
-
+buildPlan plan = do
   pid <- getCurrentPid
   (_, xs, ys) <- foldrM (work pid) (mempty :: HashSet FilePath, [], []) plan
   pure $ xs ++ ys
@@ -1142,11 +1099,11 @@ determineScenario
 
         spanDirs <- view spanDirectories
         let gs = groupPhotos spanDirs _scenarioDestination utc details
-        whenDebug $ forM_ gs $ putStrLn_ Debug . ppShow
+        whenExtraDebug $ forM_ gs $ putStrLn_ Debug . ppShow
         srs <- computeRenamings _scenarioDestination gs
-        whenDebug $ renderMappings tz srs
+        whenExtraDebug $ renderMappings tz srs
         rs <- cleanRenamings tz srs
-        whenDebug $ renderMappings tz rs
+        whenExtraDebug $ renderMappings tz rs
         pure (gs, srs, rs)
 
       doBuildPlan renamings = do
@@ -1154,7 +1111,7 @@ determineScenario
           "Building renaming plan (from "
             ++ show (length renamings)
             ++ " renamings)..."
-        p <- buildPlan tz renamings
+        p <- buildPlan renamings
         whenDebug $ renderMappings tz p
         pure p
 
@@ -1182,14 +1139,6 @@ safePruneDirectory path = do
   when safeToRemove $
     safeRemoveDirectory path
 
-safeRemoveFile ::
-  (MonadReader Options m, MonadLog m, MonadFSWrite m) =>
-  FilePath ->
-  m ()
-safeRemoveFile path = do
-  -- putStrLn_ Debug $ "- " ++ path
-  removeFile path
-
 safeMoveFile ::
   ( MonadReader Options m,
     MonadLog m,
@@ -1216,7 +1165,7 @@ safeMoveFile label src dst
           safeMoveFile label src (dropExtension dst ++ "+" ++ takeExtension dst)
         else do
           copyFileWithMetadata src dst
-          safeRemoveFile src
+          removeFile src
           pure 0
 
 executePlan ::

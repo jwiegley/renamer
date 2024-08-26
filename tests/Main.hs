@@ -175,16 +175,16 @@ testFollowBase = testCase "base" $ do
       photo "test/240806_0082.JPG" "2024-08-16T20:52:16.354628974Z"
       file "test/240806_0082.xmp"
   srs
-    @?== [ forTime
+    @?== [ forBase f81xmp "test/240816_0001.xmp" "test/240806_0081",
+           forTime
              f81cr3
              "test/240816_0001.cr3"
              "2024-08-16T19:35:40.702857Z",
-           forBase f81xmp "test/240816_0001.xmp" "test/240806_0081",
+           forBase f82xmp "test/240816_0002.xmp" "test/240806_0082",
            forTime
              f82jpg
              "test/240816_0002.jpg"
-             "2024-08-16T20:52:16.354628974Z",
-           forBase f82xmp "test/240816_0002.xmp" "test/240806_0082"
+             "2024-08-16T20:52:16.354628974Z"
          ]
   filter idempotentRenaming srs @?== []
   groupRenamingsBy (^. renamingFrom) srs @?== []
@@ -214,30 +214,36 @@ testFollowBaseAsScenario = testCase "base" $ do
         _scenarioPhotoGroups =
           [ Right
               ( PhotoGroup
-                  ( (f81cr3, ForTime (time "2024-08-16T19:35:40.702857Z"))
-                      :| [(f81xmp, ForBase "test/240806_0081")]
+                  ( (f81xmp, ForBase "test/240806_0081")
+                      :| [ ( f81cr3,
+                             ForTime (time "2024-08-16T19:35:40.702857Z")
+                           )
+                         ]
                   )
                   (Prefix "test/240816")
               ),
             Right
               ( PhotoGroup
-                  ( (f82jpg, ForTime (time "2024-08-16T20:52:16.354628974Z"))
-                      :| [(f82xmp, ForBase "test/240806_0082")]
+                  ( (f82xmp, ForBase "test/240806_0082")
+                      :| [ ( f82jpg,
+                             ForTime (time "2024-08-16T20:52:16.354628974Z")
+                           )
+                         ]
                   )
                   (Prefix "test/240816")
               )
           ],
         _scenarioSimpleRenamings =
-          [ forTime
+          [ forBase f81xmp "test/240816_0001.xmp" "test/240806_0081",
+            forTime
               f81cr3
               "test/240816_0001.cr3"
               "2024-08-16T19:35:40.702857Z",
-            forBase f81xmp "test/240816_0001.xmp" "test/240806_0081",
+            forBase f82xmp "test/240816_0002.xmp" "test/240806_0082",
             forTime
               f82jpg
               "test/240816_0002.jpg"
-              "2024-08-16T20:52:16.354628974Z",
-            forBase f82xmp "test/240816_0002.xmp" "test/240806_0082"
+              "2024-08-16T20:52:16.354628974Z"
           ],
         _scenarioRenamings =
           [ forTime
