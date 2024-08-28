@@ -164,10 +164,6 @@ instance FromJSON FileDetails
 data RenamerState = RenamerState
   { _nameCounter :: HashMap String Int,
     _nameReservations :: HashMap String IntSet,
-    -- | Mapping from file basename to list of entries sharing that basename,
-    --   and whatever renaming has been determined for that base
-    _entriesAtBase :: HashMap FilePath [FileDetails],
-    _renamedEntries :: HashSet FilePath,
     -- | A unique counter used to name temporary files
     _uniqueCounter :: Integer,
     _errorCount :: Integer
@@ -186,8 +182,6 @@ newRenamerState =
   RenamerState
     { _nameCounter = mempty,
       _nameReservations = mempty,
-      _entriesAtBase = mempty,
-      _renamedEntries = mempty,
       _uniqueCounter = 0,
       _errorCount = 0
     }
