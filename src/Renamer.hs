@@ -142,9 +142,9 @@ isImage ext = case strToLower ext of
   _ -> False
 
 data FileDetails = FileDetails
-  { _captureTime :: Maybe UTCTime,
+  { _filedir :: FilePath, -- "/foo"
+    _captureTime :: Maybe UTCTime,
     _filepath :: FilePath, -- "/foo/bar.CR3"
-    _filedir :: FilePath, -- "/foo"
     _filename :: FilePath, -- "bar.CR3"
     _filebase :: FilePath, -- "bar"
     _fileroot :: FilePath, -- "/foo/bar" or "bar", depending on spanDirectories
@@ -788,6 +788,7 @@ groupPhotos spanDirs destDir tz =
     . gatherRoots
     . keepGroupsIf (hasUniqueExts . NE.toList)
     . groupDetailsByTime spanDirs
+    . sort
   where
     key = keyDir spanDirs destDir
 
