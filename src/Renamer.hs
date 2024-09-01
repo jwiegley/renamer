@@ -25,6 +25,7 @@ module Renamer
     Renaming (Renaming),
     HasRenaming (..),
     Mapping,
+    SimpleMapping,
     Scenario (..),
     Prefix (Prefix),
     HasScenario (..),
@@ -564,15 +565,16 @@ exiftoolDateTimeOriginal path = do
 
 renderDetails ::
   (MonadReader Options m, MonadLog m) =>
+  TimeZone ->
   String ->
   [FileDetails] ->
   m ()
-renderDetails label ds = do
+renderDetails tz label ds = do
   forM_ ds $ \d ->
     putStrLn_ Debug $
       label
         ++ d ^. filepath
-        ++ maybe "" ((" @ " ++) . show) (d ^. captureTime)
+        ++ maybe "" ((" @ " ++) . show . utcToLocalTime tz) (d ^. captureTime)
   flushLog
 
 getFileDetails ::
@@ -636,7 +638,7 @@ gatherDetails ::
   ) =>
   [FilePath] ->
   m [FileDetails]
-gatherDetails = concatMapM $ \entry -> do
+gatherDetails = (fmap sort .) . concatMapM $ \entry -> do
   -- Get info on all entries; this is stateful and builds up the following
   -- tables:
   --   filepathToIdx
@@ -688,7 +690,7 @@ processDetails ::
   Maybe FilePath ->
   [FileDetails] ->
   m [FileDetails]
-processDetails mdest = mapM (registerFileDetails mdest) . sort
+processDetails mdest = mapM (registerFileDetails mdest)
 
 {-------------------------------------------------------------------------
  - Step 5: Naming
@@ -712,6 +714,12 @@ instance FromJSON Reason
 data PhotoGroup = PhotoGroup (NonEmpty (FileDetails, Reason)) Prefix
   deriving (Eq, Ord, Show, Generic)
 
+photoGroupCaptureTime :: PhotoGroup -> UTCTime
+photoGroupCaptureTime (PhotoGroup xs _) =
+  case xs ^.. traverse . _1 . captureTime . _Just of
+    (x : _) -> x
+    _ -> error "Photo group with no capture time!"
+
 instance ToJSON PhotoGroup where
   toEncoding = genericToEncoding JSON.defaultOptions
 
@@ -722,7 +730,7 @@ data Renaming a b = Renaming
     _renamingTo :: b,
     _renamingFor :: Reason
   }
-  deriving (Eq, Show, Generic)
+  deriving (Eq, Ord, Show, Generic)
 
 makeClassy ''Renaming
 
@@ -779,16 +787,20 @@ gatherRoots = foldr' go []
 -- a set of file details into an identified set of files and photo groups.
 groupPhotos ::
   Bool ->
-  Maybe FilePath ->
   TimeZone ->
+  Maybe FilePath ->
   [FileDetails] ->
   [Either FileDetails PhotoGroup]
-groupPhotos spanDirs destDir tz =
-  Prelude.map go
+groupPhotos spanDirs tz destDir =
+  sortOn
+    ( \case
+        Left x -> x ^. captureTime
+        Right g -> Just (photoGroupCaptureTime g)
+    )
+    . Prelude.map go
     . gatherRoots
     . keepGroupsIf (hasUniqueExts . NE.toList)
     . groupDetailsByTime spanDirs
-    . sort
   where
     key = keyDir spanDirs destDir
 
@@ -825,7 +837,7 @@ computeRenamings ::
   Maybe FilePath ->
   [Either FileDetails PhotoGroup] ->
   m [Mapping]
-computeRenamings destDir = concatMapM go . sort
+computeRenamings destDir = concatMapM go
   where
     go (Left x) = [] <$ maybeReserveCounter destDir (x ^. filepath)
     go (Right (PhotoGroup xs (Prefix prefix))) = do
@@ -835,7 +847,7 @@ computeRenamings destDir = concatMapM go . sort
           NE.map
             ( \(x, r) ->
                 Renaming
-                  (x ^. filepath)
+                  x
                   (goalPath destDir x (Prefix (takeBaseName prefix)) num)
                   r
             )
@@ -843,7 +855,7 @@ computeRenamings destDir = concatMapM go . sort
 
 mappingLabel' ::
   TimeZone ->
-  Renaming FilePath FilePath ->
+  Renaming a FilePath ->
   FilePath ->
   FilePath ->
   String
@@ -859,24 +871,25 @@ mappingLabel' tz ren src dst =
       where
         tm' = utcToLocalTime tz tm
 
-mappingLabel :: TimeZone -> Renaming FilePath FilePath -> String
-mappingLabel tz ren =
-  mappingLabel' tz ren (ren ^. renamingFrom) (ren ^. renamingTo)
+mappingLabel :: TimeZone -> (a -> FilePath) -> Renaming a FilePath -> String
+mappingLabel tz f ren =
+  mappingLabel' tz ren (f (ren ^. renamingFrom)) (ren ^. renamingTo)
 
 renderMappings ::
   (MonadReader Options m, MonadLog m) =>
   String ->
   TimeZone ->
-  [Mapping] ->
+  (a -> FilePath) ->
+  [Renaming a FilePath] ->
   m ()
-renderMappings label tz rs = do
+renderMappings label tz f rs = do
   forM_ rs $
-    putStrLn_ Debug . (label ++) . mappingLabel tz
+    putStrLn_ Debug . (label ++) . mappingLabel tz f
   flushLog
 
 -- | Entries that would rename a file to itself.
 idempotentRenaming :: Mapping -> Bool
-idempotentRenaming ren = ren ^. renamingFrom == ren ^. renamingTo
+idempotentRenaming ren = ren ^. renamingFrom . filepath == ren ^. renamingTo
 
 redundantRenaming ::
   Mapping ->
@@ -910,15 +923,19 @@ removeOverlappedRenamings rs =
     onlyOverlaps rs' ++ onlyOverlaps rs''
   )
   where
-    rs' = nonOverlapped (^. renamingFrom) rs
+    rs' = nonOverlapped (^. renamingFrom . filepath) rs
     rs'' = nonOverlapped (^. renamingTo) (Prelude.map fst rs')
 
+    nonOverlapped ::
+      (Mapping -> FilePath) ->
+      [Mapping] ->
+      [(Mapping, [Mapping])]
     nonOverlapped f =
       foldr
         ( \rens rest ->
             let k r = case r ^. renamingFor of
                   ForBase _ ->
-                    r ^. renamingFrom
+                    r ^. renamingFrom . filepath
                       `notElem` rest ^.. traverse . _1 . renamingFor . _ForBase
                   _ -> True
              in -- We can't do a trivial sort here, which might select
@@ -965,21 +982,21 @@ cleanRenamings tz rs =
   assert
     ( Prelude.all
         (\g -> length (NE.filter (has (renamingFor . _ForTime)) g) < 2)
-        (groupRenamingsBy (^. renamingFrom) rs)
+        (groupRenamingsBy (^. renamingFrom . filepath) rs)
     )
     $ do
       let rs' =
             removeRedundantRenamings (^. renamingTo) $
-              removeRedundantRenamings (^. renamingFrom) $
+              removeRedundantRenamings (^. renamingFrom . filepath) $
                 filter (not . idempotentRenaming) $
                   rs
           (rs'', overlaps) = removeOverlappedRenamings rs'
       forM_ overlaps $ \(x, ys) -> do
         putStrLn_ Normal $ "Preferring this renaming:"
-        putStrLn_ Normal $ "    " ++ mappingLabel tz x
+        putStrLn_ Normal $ "    " ++ mappingLabel tz (^. filepath) x
         putStrLn_ Normal $ "  over these:"
         forM_ ys $ \y ->
-          putStrLn_ Normal $ "    " ++ mappingLabel tz y
+          putStrLn_ Normal $ "    " ++ mappingLabel tz (^. filepath) y
       flushLog
       pure rs''
 
@@ -987,7 +1004,9 @@ cleanRenamings tz rs =
  - Step 6: Plan
  -}
 
-type Mapping = Renaming FilePath FilePath
+type Mapping = Renaming FileDetails FilePath
+
+type SimpleMapping = Renaming FilePath FilePath
 
 nextUniqueNum :: (MonadState RenamerState m) => m Integer
 nextUniqueNum = do
@@ -1001,14 +1020,15 @@ buildPlan ::
     MonadProc m
   ) =>
   [Mapping] ->
-  m [Mapping]
+  m [SimpleMapping]
 buildPlan plan = do
   pid <- getCurrentPid
   (_, xs, ys) <- foldrM (work pid) (mempty :: HashSet FilePath, [], []) plan
   pure $ xs ++ ys
   where
     work pid (Renaming src dst ren) (srcs, rest, post)
-      | has (ix (strToLower dst)) srcs = do
+      | has (ix (strToLower dst)) srcs
+          && strToLower srcPath /= strToLower dst = do
           uniqueIdx <- nextUniqueNum
           let tmp =
                 takeDirectory dst
@@ -1017,16 +1037,18 @@ buildPlan plan = do
                   ++ "_"
                   ++ show uniqueIdx
           pure
-            ( srcs & at (strToLower src) ?~ (),
-              Renaming src tmp ren : rest,
+            ( srcs & at (strToLower srcPath) ?~ (),
+              Renaming srcPath tmp ren : rest,
               Renaming tmp dst ren : post
             )
       | otherwise =
           pure
-            ( srcs & at (strToLower src) ?~ (),
-              Renaming src dst ren : rest,
+            ( srcs & at (strToLower srcPath) ?~ (),
+              Renaming srcPath dst ren : rest,
               post
             )
+      where
+        srcPath = src ^. filepath
 
 {-------------------------------------------------------------------------
  - Step 7: Execute
@@ -1041,7 +1063,7 @@ data Scenario = Scenario
     _scenarioPhotoGroups :: [Either FileDetails PhotoGroup],
     _scenarioSimpleRenamings :: [Mapping],
     _scenarioRenamings :: [Mapping],
-    _scenarioMappings :: [Mapping]
+    _scenarioMappings :: [SimpleMapping]
   }
   deriving (Eq, Show, Generic)
 
@@ -1062,11 +1084,12 @@ scenarioDetails ::
     MonadPhoto m,
     MonadLog m
   ) =>
+  TimeZone ->
   [FilePath] ->
   [FilePath] ->
   Maybe FilePath ->
   m ([FileDetails], [FileDetails])
-scenarioDetails repos inputs destDir = do
+scenarioDetails tz repos inputs destDir = do
   putStrLn_ Normal "Gathering details..."
   flushLog
   rds <-
@@ -1075,11 +1098,11 @@ scenarioDetails repos inputs destDir = do
       else
         gatherDetails repos
           >>= processDetails destDir
-  whenDebug $ renderDetails "REPO-DETAIL: " rds
+  whenDebug $ renderDetails tz "REPO-DETAIL: " rds
   ds <-
     gatherDetails inputs
       >>= processDetails destDir
-  whenDebug $ renderDetails "FROM-DETAIL: " ds
+  whenDebug $ renderDetails tz "FROM-DETAIL: " ds
   pure (rds, ds)
 
 determineScenario ::
@@ -1121,7 +1144,7 @@ determineScenario
         flushLog
 
         spanDirs <- view spanDirectories
-        let gs = groupPhotos spanDirs _scenarioDestination utc ds
+        let gs = groupPhotos spanDirs tz _scenarioDestination ds
         whenExtraDebug $
           forM_ gs $
             putStrLn_ ExtraDebug . ("GROUP: " ++) . ppShow
@@ -1132,14 +1155,14 @@ determineScenario
             ++ " files and photo groups)..."
         flushLog
         srs <- computeRenamings _scenarioDestination gs
-        whenExtraDebug $ renderMappings "SIMPLE: " tz srs
+        whenExtraDebug $ renderMappings "SIMPLE: " tz (^. filepath) srs
         putStrLn_ Normal $
           "Cleaning up renamings (from "
             ++ show (length srs)
             ++ " initial renamings)..."
         flushLog
         rs <- cleanRenamings tz srs
-        whenExtraDebug $ renderMappings "CLEAN: " tz rs
+        whenExtraDebug $ renderMappings "CLEAN: " tz (^. filepath) rs
         pure (gs, srs, rs)
 
       doBuildPlan rs = do
@@ -1149,7 +1172,7 @@ determineScenario
             ++ " final renamings)..."
         flushLog
         p <- buildPlan rs
-        whenDebug $ renderMappings "PLAN: " tz p
+        whenDebug $ renderMappings "PLAN: " tz id p
         pure p
 
 safeRemoveDirectory ::
@@ -1215,7 +1238,7 @@ executePlan ::
     MonadFSWrite m
   ) =>
   TimeZone ->
-  [Mapping] ->
+  [SimpleMapping] ->
   m Integer
 executePlan tz plan = do
   putStrLn_ Normal $
@@ -1226,6 +1249,7 @@ executePlan tz plan = do
   results <- forM plan $ \ren@(Renaming src dst _) ->
     safeMoveFile (mappingLabel' tz ren) src dst
   let errors = sum results
+  flushLog
   putStrLn_ Normal $ "Renaming completed with " ++ show errors ++ " errors"
   flushLog
   pure errors

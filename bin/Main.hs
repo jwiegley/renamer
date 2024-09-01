@@ -185,7 +185,7 @@ renamePhotos opts tz repos inputs destDir = do
             Just s -> pure s
             Nothing -> error $ "Failed to read scenario from " ++ fromPath
         Nothing -> do
-          (rds, ds) <- scenarioDetails repos inputs destDir
+          (rds, ds) <- scenarioDetails tz repos inputs destDir
           determineScenario tz rds ds destDir
     mtoPath <- view scenarioTo
     forM_ mtoPath $ \toPath ->

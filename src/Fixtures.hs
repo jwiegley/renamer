@@ -189,10 +189,16 @@ file path =
   envFileTree %= \t ->
     adjustPath t (Just (FileEntry Nothing 100)) path
 
-forBase :: FileDetails -> String -> FilePath -> Mapping
+forBase' :: FileDetails -> String -> FilePath -> Mapping
+forBase' details name n = Renaming details name (ForBase n)
+
+forTime' :: FileDetails -> String -> String -> Mapping
+forTime' details name n = Renaming details name (ForTime (time n))
+
+forBase :: FileDetails -> String -> FilePath -> SimpleMapping
 forBase details name n = Renaming (details ^. filepath) name (ForBase n)
 
-forTime :: FileDetails -> String -> String -> Mapping
+forTime :: FileDetails -> String -> String -> SimpleMapping
 forTime details name n = Renaming (details ^. filepath) name (ForTime (time n))
 
 ls :: Simulation ()
@@ -253,15 +259,15 @@ renamerNoIdemCheck ::
 renamerNoIdemCheck repos inputs destDir = do
   res <- runAppT
     ( defaultOptions
-        & quiet .~ True
-        -- & quiet .~ False
-        -- & verbose .~ True
-        -- & debug .~ True
+        -- & quiet .~ True
+        & quiet .~ False
+        & verbose .~ True
+        & debug .~ True
         & recursive .~ True
         & execute .~ True
     )
     $ do
-      (rds, ds) <- scenarioDetails repos inputs destDir
+      (rds, ds) <- scenarioDetails utc repos inputs destDir
       s <- determineScenario utc rds ds destDir
       (s,) <$> renamerExecute utc s
   (res,) <$> allPaths
@@ -315,7 +321,7 @@ importer paths froms destDir setup = do
           gatherDetails froms
             >>= processDetails (Just destDir)
             >>= computeRenamings (Just destDir)
-              . groupPhotos spanDirs (Just destDir) utc
+              . groupPhotos spanDirs utc (Just destDir)
             >>= cleanRenamings utc
             >>= buildPlan
             >>= executePlan utc
