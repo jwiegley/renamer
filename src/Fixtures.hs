@@ -259,10 +259,10 @@ renamerNoIdemCheck ::
 renamerNoIdemCheck repos inputs destDir = do
   res <- runAppT
     ( defaultOptions
-        -- & quiet .~ True
-        & quiet .~ False
-        & verbose .~ True
-        & debug .~ True
+        & quiet .~ True
+        -- & quiet .~ False
+        -- & verbose .~ True
+        -- & debug .~ True
         & recursive .~ True
         & execute .~ True
     )
@@ -317,11 +317,10 @@ importer paths froms destDir setup = do
           _ <-
             gatherDetails paths
               >>= processDetails (Just destDir)
-          spanDirs <- view spanDirectories
           gatherDetails froms
             >>= processDetails (Just destDir)
             >>= computeRenamings (Just destDir)
-              . groupPhotos spanDirs utc (Just destDir)
+              . groupPhotos utc (Just destDir)
             >>= cleanRenamings utc
             >>= buildPlan
             >>= executePlan utc

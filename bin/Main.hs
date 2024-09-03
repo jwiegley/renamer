@@ -151,10 +151,6 @@ main = do
           ( long "keep-state"
               <> help "Keep state in .file-details.json (to aid debugging)"
           )
-        <*> switch
-          ( long "span"
-              <> help "Number photos within YYmmdd periods across directories"
-          )
         <*> optional
           ( strOption
               ( long "write-scenario"

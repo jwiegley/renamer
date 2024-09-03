@@ -148,7 +148,7 @@ data FileDetails = FileDetails
     _filepath :: FilePath, -- "/foo/bar.CR3"
     _filename :: FilePath, -- "bar.CR3"
     _filebase :: FilePath, -- "bar"
-    _fileroot :: FilePath, -- "/foo/bar" or "bar", depending on spanDirectories
+    _fileroot :: FilePath, -- "/foo/bar"
     _fileext :: FilePath, -- ".CR3"
     _filesize :: Integer
   }
@@ -213,7 +213,6 @@ data Options = Options
     _recursive :: !Bool,
     _execute :: !Bool,
     _keepState :: !Bool,
-    _spanDirectories :: !Bool,
     _scenarioTo :: !(Maybe FilePath),
     _scenarioFrom :: !(Maybe FilePath)
   }
@@ -232,7 +231,6 @@ defaultOptions =
       _recursive = False,
       _execute = False,
       _keepState = False,
-      _spanDirectories = False,
       _scenarioTo = Nothing,
       _scenarioFrom = Nothing
     }
@@ -332,10 +330,9 @@ normalizeExt ext = case strToLower ext of
 
 -- Given a directory /foo/bar, this calculates what the "key" directory is for
 -- calculations related to the counter.
-keyDir :: Bool -> Maybe FilePath -> FilePath -> FilePath
-keyDir True _ _ = ""
-keyDir _spanDirs@False Nothing dir = dir
-keyDir _spanDirs@False _destDir@(Just dir) _ = dir
+keyDir :: Maybe FilePath -> FilePath -> FilePath
+keyDir Nothing dir = dir
+keyDir _destDir@(Just dir) _ = dir
 
 goalPath ::
   Maybe FilePath ->
@@ -355,17 +352,16 @@ nextNameCounter ::
   Prefix ->
   m Int
 nextNameCounter (Prefix prefix) = do
-  spanDirs <- view spanDirectories
   preuse (nameCounter . ix prefix) >>= \case
-    Just idx -> go spanDirs idx
+    Just idx -> go idx
     Nothing -> do
       nameCounter . at prefix ?= 1
-      go spanDirs 1
+      go 1
   where
-    go spanDirs i = do
+    go i = do
       nameCounter . ix prefix += 1
       preuse (nameReservations . ix prefix) >>= \case
-        Just s | has (ix i) s -> go spanDirs (succ i)
+        Just s | has (ix i) s -> go (succ i)
         _ -> pure i
 
 nameRe :: String
@@ -391,9 +387,8 @@ maybeUpdateNameCounter ::
   FilePath ->
   m ()
 maybeUpdateNameCounter destDir path =
-  maybeWithCounter path $ \prefix counter -> do
-    spanDirs <- view spanDirectories
-    nameCounter . at (keyDir spanDirs destDir (takeDirectory path) </> prefix)
+  maybeWithCounter path $ \prefix counter ->
+    nameCounter . at (keyDir destDir (takeDirectory path) </> prefix)
       %= Just . \case
         Just count -> max count (succ counter)
         Nothing -> succ counter
@@ -404,10 +399,9 @@ maybeReserveCounter ::
   FilePath ->
   m ()
 maybeReserveCounter destDir path =
-  maybeWithCounter path $ \prefix counter -> do
-    spanDirs <- view spanDirectories
+  maybeWithCounter path $ \prefix counter ->
     nameReservations
-      . at (keyDir spanDirs destDir (takeDirectory path) </> prefix)
+      . at (keyDir destDir (takeDirectory path) </> prefix)
       %= Just . \case
         Just s -> s & at counter ?~ ()
         Nothing -> mempty & at counter ?~ ()
@@ -579,10 +573,9 @@ renderDetails tz label ds = do
 
 getFileDetails ::
   (MonadPhoto m, MonadFSRead m) =>
-  Bool ->
   FilePath ->
   m FileDetails
-getFileDetails spanDirs _filepath = do
+getFileDetails _filepath = do
   isFile <- doesFileExist _filepath
   if isFile
     then do
@@ -598,9 +591,7 @@ getFileDetails spanDirs _filepath = do
     _filename = takeFileName _filepath
     _filebase = takeBaseName _filepath
     _fileext = takeExtension _filepath
-    _fileroot
-      | spanDirs = _filebase
-      | otherwise = dropExtension _filepath
+    _fileroot = dropExtension _filepath
 
 walkFileEntries ::
   (MonadFSRead m, MonadLog m) =>
@@ -644,7 +635,6 @@ gatherDetails = (fmap sort .) . concatMapM $ \entry -> do
   --   filepathToIdx
   --   idxToFilepath
   recurse <- view recursive
-  spanDirs <- view spanDirectories
   isDir <- doesDirectoryExist entry
   details <-
     if isDir
@@ -663,7 +653,7 @@ gatherDetails = (fmap sort .) . concatMapM $ \entry -> do
             flushLog
             details <-
               parallelInterleaved
-                =<< walkFileEntries recurse (getFileDetails spanDirs) entry
+                =<< walkFileEntries recurse getFileDetails entry
             when stateful $
               encodeFile detailsFile details
             pure details
@@ -671,7 +661,7 @@ gatherDetails = (fmap sort .) . concatMapM $ \entry -> do
         putStrLn_ Normal $ "Gathering details from " ++ show entry
         flushLog
         parallelInterleaved
-          =<< walkFileEntries recurse (getFileDetails spanDirs) entry
+          =<< walkFileEntries recurse getFileDetails entry
   stopGlobalPool
   pure details
 
@@ -747,9 +737,9 @@ prefixFromTime path tz tm = Prefix (path </> yymmdd (utcToLocalTime tz tm))
 
 -- Even if two files have the same base name, if they have capture times that
 -- differ, we do not group them together.
-groupDetailsByTime :: Bool -> [FileDetails] -> [NonEmpty FileDetails]
-groupDetailsByTime spanDirs = NE.groupBy $ \x y ->
-  (spanDirs || x ^. filedir == y ^. filedir)
+groupDetailsByTime :: [FileDetails] -> [NonEmpty FileDetails]
+groupDetailsByTime = NE.groupBy $ \x y ->
+  x ^. filedir == y ^. filedir
     && case (x ^. captureTime, y ^. captureTime) of
       (Just tmx, Just tmy) -> tmx == tmy
       _ -> False
@@ -786,12 +776,11 @@ gatherRoots = foldr' go []
 -- This is the most complex function in the renamer, since it's job is to turn
 -- a set of file details into an identified set of files and photo groups.
 groupPhotos ::
-  Bool ->
   TimeZone ->
   Maybe FilePath ->
   [FileDetails] ->
   [Either FileDetails PhotoGroup]
-groupPhotos spanDirs tz destDir =
+groupPhotos tz destDir =
   sortOn
     ( \case
         Left x -> x ^. captureTime
@@ -800,9 +789,9 @@ groupPhotos spanDirs tz destDir =
     . Prelude.map go
     . gatherRoots
     . keepGroupsIf (hasUniqueExts . NE.toList)
-    . groupDetailsByTime spanDirs
+    . groupDetailsByTime
   where
-    key = keyDir spanDirs destDir
+    key = keyDir destDir
 
     go (d :| []) = case d ^. captureTime of
       Just tm ->
@@ -1143,8 +1132,7 @@ determineScenario
             ++ " entries)..."
         flushLog
 
-        spanDirs <- view spanDirectories
-        let gs = groupPhotos spanDirs tz _scenarioDestination ds
+        let gs = groupPhotos tz _scenarioDestination ds
         whenExtraDebug $
           forM_ gs $
             putStrLn_ ExtraDebug . ("GROUP: " ++) . ppShow
