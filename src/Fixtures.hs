@@ -24,6 +24,7 @@ import Data.Time.Format.ISO8601
 import Debug.Trace
 import GHC.Generics
 import Renamer
+import System.Directory qualified as Dir
 import System.FilePath
 import System.IO (hFlush, stdout)
 import System.IO.Unsafe (unsafePerformIO)
@@ -173,6 +174,8 @@ instance MonadFSWrite Simulation where
       Just x@(FileEntry _ _) ->
         envFileTree .= adjustPath t (Just x) dest
       _ -> error $ "Not a file: " ++ path
+  getPermissions _ = pure Dir.emptyPermissions
+  setPermissions _ _ = pure ()
 
 time :: String -> UTCTime
 time str = case iso8601ParseM str of

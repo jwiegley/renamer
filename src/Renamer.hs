@@ -468,6 +468,18 @@ class (Monad m) => MonadFSWrite m where
   removeDirectory :: FilePath -> m ()
   renameFile :: FilePath -> FilePath -> m ()
   copyFileWithMetadata :: FilePath -> FilePath -> m ()
+  getPermissions :: FilePath -> m Dir.Permissions
+  setPermissions :: FilePath -> Dir.Permissions -> m ()
+
+makeReadonly :: (MonadFSWrite m) => FilePath -> m ()
+makeReadonly f = do
+  p <- getPermissions f
+  setPermissions f (p {Dir.readable = False})
+
+makeNonExecutable :: (MonadFSWrite m) => FilePath -> m ()
+makeNonExecutable f = do
+  p <- getPermissions f
+  setPermissions f (p {Dir.executable = False})
 
 instance MonadFSRead IO where
   listDirectory = Dir.listDirectory
@@ -492,18 +504,24 @@ instance MonadFSWrite IO where
   removeDirectory = Dir.removeDirectory
   renameFile = Dir.renameFile
   copyFileWithMetadata = Dir.copyFileWithMetadata
+  getPermissions = Dir.getPermissions
+  setPermissions = Dir.setPermissions
 
 instance (MonadFSWrite m) => MonadFSWrite (ReaderT e m) where
   removeFile = lift . removeFile
   removeDirectory = lift . removeDirectory
   renameFile = (lift .) . renameFile
   copyFileWithMetadata = (lift .) . copyFileWithMetadata
+  getPermissions = lift . getPermissions
+  setPermissions = (lift .) . setPermissions
 
 instance (MonadFSWrite m) => MonadFSWrite (StateT s m) where
   removeFile = lift . removeFile
   removeDirectory = lift . removeDirectory
   renameFile = (lift .) . renameFile
   copyFileWithMetadata = (lift .) . copyFileWithMetadata
+  getPermissions = lift . getPermissions
+  setPermissions = (lift .) . setPermissions
 
 class (Monad m) => MonadJSON m where
   decodeFileStrict :: (FromJSON a) => FilePath -> m (Maybe a)
@@ -1164,13 +1182,15 @@ determineScenario
         pure p
 
 safeRemoveDirectory ::
-  (MonadReader Options m, MonadLog m, MonadFSWrite m) =>
+  (MonadReader Options m, MonadLog m, MonadFSRead m, MonadFSWrite m) =>
   FilePath ->
   m ()
 safeRemoveDirectory path = do
-  putStrLn_ Normal $ "- " ++ path
-  flushLog
-  removeDirectory path
+  entries <- listDirectory path
+  when (null entries) $ do
+    putStrLn_ Normal $ "- " ++ path
+    flushLog
+    removeDirectory path
 
 safePruneDirectory ::
   (MonadReader Options m, MonadLog m, MonadFSRead m, MonadFSWrite m) =>
@@ -1216,6 +1236,8 @@ safeMoveFile label src dst
           safeMoveFile label src (dropExtension dst ++ "+" ++ takeExtension dst)
         else do
           copyFileWithMetadata src dst
+          makeReadonly dst
+          makeNonExecutable dst
           removeFile src
           pure 0
 

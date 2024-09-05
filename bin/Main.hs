@@ -53,7 +53,7 @@ main = do
   errors <- case cmd of
     RenamePhotos repos ->
       renamePhotos opts tz repos [] Nothing
-    ImportPhotos repos destDir inputs ->
+    ImportPhotos inputs destDir repos ->
       renamePhotos opts tz repos inputs (Just destDir)
   if errors == 0
     then exitSuccess
