@@ -317,13 +317,13 @@ importer paths froms destDir setup = do
             & execute .~ True
         )
         $ do
-          _ <-
-            gatherDetails paths
-              >>= processDetails (Just destDir)
-          gatherDetails froms
+          gatherDetails paths
             >>= processDetails (Just destDir)
-            >>= computeRenamings (Just destDir)
-              . groupPhotos utc (Just destDir)
+          ds <- gatherDetails froms
+          processDetails (Just destDir) ds
+          computeRenamings
+            (Just destDir)
+            (groupPhotos utc (Just destDir) ds)
             >>= cleanRenamings utc
             >>= buildPlan
             >>= executePlan utc

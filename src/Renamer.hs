@@ -683,22 +683,16 @@ gatherDetails = (fmap sort .) . concatMapM $ \entry -> do
   stopGlobalPool
   pure details
 
-registerFileDetails ::
-  (MonadReader Options m, MonadState RenamerState m) =>
-  Maybe FilePath ->
-  FileDetails ->
-  m FileDetails
-registerFileDetails destDir FileDetails {..} = do
-  when (isJust destDir) $
-    maybeUpdateNameCounter destDir _filepath
-  pure FileDetails {..}
-
 processDetails ::
   (MonadReader Options m, MonadState RenamerState m) =>
   Maybe FilePath ->
   [FileDetails] ->
-  m [FileDetails]
-processDetails mdest = mapM (registerFileDetails mdest)
+  m ()
+processDetails = mapM_ . registerFileDetails
+  where
+    registerFileDetails destDir d
+      | isJust destDir = maybeUpdateNameCounter destDir (d ^. filepath)
+      | otherwise = pure ()
 
 {-------------------------------------------------------------------------
  - Step 5: Naming
@@ -1102,13 +1096,15 @@ scenarioDetails tz repos inputs destDir = do
   rds <-
     if null repos
       then pure []
-      else
-        gatherDetails repos
-          >>= processDetails destDir
+      else do
+        ds <- gatherDetails repos
+        processDetails destDir ds
+        pure ds
   whenDebug $ renderDetails tz "REPO-DETAIL: " rds
-  ds <-
-    gatherDetails inputs
-      >>= processDetails destDir
+  ds <- do
+    ds <- gatherDetails inputs
+    processDetails destDir ds
+    pure ds
   whenDebug $ renderDetails tz "FROM-DETAIL: " ds
   pure (rds, ds)
 
