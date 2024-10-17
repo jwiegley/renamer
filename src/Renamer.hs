@@ -474,7 +474,7 @@ class (Monad m) => MonadFSWrite m where
 makeReadonly :: (MonadFSWrite m) => FilePath -> m ()
 makeReadonly f = do
   p <- getPermissions f
-  setPermissions f (p {Dir.readable = False})
+  setPermissions f (p {Dir.writeable = False})
 
 makeNonExecutable :: (MonadFSWrite m) => FilePath -> m ()
 makeNonExecutable f = do
