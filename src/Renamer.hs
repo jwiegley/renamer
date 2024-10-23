@@ -639,6 +639,7 @@ walkFileEntries recurse f path = do
 --   all files involved, recursively.
 gatherDetails ::
   ( MonadReader Options m,
+    MonadState RenamerState m,
     MonadLog m,
     MonadFSRead m,
     MonadJSON m,
@@ -676,10 +677,14 @@ gatherDetails = (fmap sort .) . concatMapM $ \entry -> do
               encodeFile detailsFile details
             pure details
       else do
-        putStrLn_ Normal $ "Gathering details from " ++ show entry
-        flushLog
-        parallelInterleaved
-          =<< walkFileEntries recurse getFileDetails entry
+        exists <- doesFileExist entry
+        if exists
+          then do
+            putStrLn_ Normal $ "Gathering details from " ++ show entry
+            flushLog
+            parallelInterleaved
+              =<< walkFileEntries recurse getFileDetails entry
+          else [] <$ logErr ("Input does not exist: " ++ entry)
   stopGlobalPool
   pure details
 
