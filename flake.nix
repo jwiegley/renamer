@@ -18,6 +18,19 @@
         };
         overlays = [ haskellNix.overlay
           (final: prev: {
+            haskellPackages = prev.haskellPackages.override {
+              overrides = hfinal: hprev: {
+                haskell-language-server =
+                  hprev.disableCabalFlag "ormolu" (
+                  hprev.disableCabalFlag "fourmolu" (
+                    hprev.haskell-language-server.override {
+                      configureFlags = [ "--flag=-ormolu" "--flag=-fourmolu" ];
+                      hls-ormolu-plugin = null;
+                      hls-fourmolu-plugin = null;
+                    }
+                  ));
+              };
+            };
             renamer =
               final.haskell-nix.project' {
                 src = ./.;
