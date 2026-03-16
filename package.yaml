@@ -6,6 +6,7 @@ author:     John Wiegley
 maintainer: johnw@newartisans.com
 category:   System
 license:    BSD3
+license-file: LICENSE.md
 
 ghc-options:
    - -Wall
