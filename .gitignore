@@ -1,2 +1,6 @@
 /dist*/
 /data/
+*.prof
+*.hp
+*.tix
+.hpc/

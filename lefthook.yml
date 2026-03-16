@@ -1,0 +1,28 @@
+pre-commit:
+  parallel: true
+  commands:
+    format-check:
+      glob: "**/*.hs"
+      run: |
+        if ! command -v fourmolu >/dev/null 2>&1; then
+          echo "SKIP: fourmolu not found (run inside nix develop)"
+          exit 0
+        fi
+        fourmolu --mode check {staged_files}
+    lint:
+      glob: "**/*.hs"
+      run: |
+        if ! command -v hlint >/dev/null 2>&1; then
+          echo "SKIP: hlint not found (run inside nix develop)"
+          exit 0
+        fi
+        hlint {staged_files}
+    nix-build:
+      glob: "**/*.{hs,nix,yaml,cabal}"
+      run: nix build --no-warn-dirty 2>&1
+    haddock:
+      glob: "**/*.hs"
+      run: cabal haddock 2>&1
+    coverage:
+      glob: "**/*.{hs,yaml,cabal}"
+      run: scripts/check-coverage.sh
