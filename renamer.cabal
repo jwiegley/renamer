@@ -29,7 +29,7 @@ library
       Paths_renamer
   hs-source-dirs:
       src
-  ghc-options: -Wall -Wno-missing-home-modules -fprof-auto
+  ghc-options: -Wall -Werror -Wno-missing-home-modules -fprof-auto
   build-depends:
       aeson
     , base >=4.7
@@ -56,7 +56,7 @@ executable renamer
       Paths_renamer
   hs-source-dirs:
       bin
-  ghc-options: -Wall -Wno-missing-home-modules -fprof-auto -threaded -rtsopts -with-rtsopts=-N
+  ghc-options: -Wall -Werror -Wno-missing-home-modules -fprof-auto -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       aeson
     , base >=4.7
@@ -85,7 +85,7 @@ test-suite renamer-tests
       Paths_renamer
   hs-source-dirs:
       tests
-  ghc-options: -Wall -Wno-missing-home-modules -fprof-auto -fno-ignore-asserts
+  ghc-options: -Wall -Werror -Wno-missing-home-modules -fprof-auto -fno-ignore-asserts
   build-depends:
       HUnit
     , aeson
