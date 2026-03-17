@@ -80,7 +80,7 @@
           } ''
             cd ${cleanSrc}
             find . -name '*.hs' \
-              -exec fourmolu --mode check --config .fourmolu.yaml {} +
+              -exec fourmolu --mode check --config fourmolu.yaml {} +
             touch $out
           '';
 
