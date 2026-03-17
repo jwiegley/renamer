@@ -23,4 +23,4 @@ jobs:
         run: nix build --no-warn-dirty --allow-import-from-derivation
 
       - name: Run all checks
-        run: nix flake check --no-warn-dirty --allow-import-from-derivation
+        run: nix flake check --no-warn-dirty --allow-import-from-derivation --system x86_64-linux
