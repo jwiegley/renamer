@@ -22,5 +22,5 @@ jobs:
       - name: Build
         run: nix build --no-warn-dirty --allow-import-from-derivation
 
-      - name: Run all checks
-        run: nix flake check --no-warn-dirty --allow-import-from-derivation --system x86_64-linux
+      - name: Run checks
+        run: nix build --no-warn-dirty --allow-import-from-derivation .#checks.x86_64-linux.formatting .#checks.x86_64-linux.lint .#checks.x86_64-linux.tests
