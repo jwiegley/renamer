@@ -20,7 +20,7 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@v8
 
       - name: Build
-        run: nix build --no-warn-dirty
+        run: nix build --no-warn-dirty --allow-import-from-derivation
 
       - name: Run all checks
-        run: nix flake check --no-warn-dirty
+        run: nix flake check --no-warn-dirty --allow-import-from-derivation
